@@ -1,0 +1,25 @@
+[versions]
+hikaricp = "7.1.0"                          # https://github.com/brettwooldridge/HikariCP/tags
+kotlin = "2.4.20"                           # https://kotlinlang.org/docs/releases.html#release-history
+kotlinx-coroutines = "1.11.0"               # https://github.com/Kotlin/kotlinx.coroutines/releases
+kotlinx-serialization = "1.11.0"            # https://github.com/Kotlin/kotlinx.serialization/releases
+mavenPublish = "0.37.0"                     # https://github.com/vanniktech/gradle-maven-publish-plugin/releases
+postgresql-jdbc = "42.7.13"                 # https://github.com/pgjdbc/pgjdbc/releases
+testcontainers = "2.0.5"                    # https://github.com/testcontainers/testcontainers-java/releases
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-plugin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+mavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
+
+[libraries]
+hikaricp = { module = "com.zaxxer:HikariCP", version.ref = "hikaricp" }
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlin-test-junit = { module = "org.jetbrains.kotlin:kotlin-test-junit", version.ref = "kotlin" }
+kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
+kotlinx-serialization = { module = "org.jetbrains.kotlinx:kotlinx-serialization-core", version.ref = "kotlinx-serialization" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql-jdbc" }
+testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
+testcontainers-postgresql = { module = "org.testcontainers:testcontainers-postgresql", version.ref = "testcontainers" }
