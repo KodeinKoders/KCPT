@@ -22,7 +22,7 @@ public class PGChannel<T>(
     private val serializer: KSerializer<T>,
     private val source: Source,
 ) {
-    private val quotedName: String = Utils.escapeIdentifier(StringBuilder(), name).toString()
+    private val quotedName: String = Utils.escapeIdentifier(null, name).toString()
 
     init {
         val byteSize = name.toByteArray(Charsets.UTF_8).size

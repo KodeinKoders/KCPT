@@ -138,7 +138,7 @@ internal class MessageQueueImpl<T> internal constructor(
                             statement.setString(1, name)
                             statement.setInt(2, config.maxTries)
                             statement.executeQuery().use { resultSet ->
-                                if (resultSet.next()) resultSet.getInstantOrNull(1)
+                                if (resultSet.next()) resultSet.getInstant(1)
                                 else null
                             }
                         }

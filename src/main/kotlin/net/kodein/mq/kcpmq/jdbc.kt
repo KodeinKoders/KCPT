@@ -29,25 +29,21 @@ internal inline fun <R> Connection.transaction(
         if (commit) {
             commit()
         }
+        autoCommit = previousAutoCommit
         return ret
     } catch (e: Throwable) {
-        try { rollback() }
-        catch (_: Throwable) {}
+        try { rollback() } catch (s: Throwable) { e.addSuppressed(s) }
+        try { autoCommit = previousAutoCommit } catch (s: Throwable) { e.addSuppressed(s) }
         throw e
-    } finally {
-        try { autoCommit = previousAutoCommit }
-        catch (_: Throwable) {}
     }
 }
 
 // pgjdbc has no java.time.Instant support in either direction; java.time.OffsetDateTime is the
 // supported type for TIMESTAMPTZ. UTC is safe here since TIMESTAMPTZ stores an absolute instant
 // and the offset is only a wire encoding.
-@OptIn(ExperimentalTime::class)
 internal fun PreparedStatement.setInstant(parameterIndex: Int, value: Instant) {
     setObject(parameterIndex, value.toJavaInstant().atOffset(ZoneOffset.UTC))
 }
 
-@OptIn(ExperimentalTime::class)
-internal fun ResultSet.getInstantOrNull(columnIndex: Int): Instant? =
-    getObject(columnIndex, OffsetDateTime::class.java)?.toInstant()?.toKotlinInstant()
+internal fun ResultSet.getInstant(columnIndex: Int): Instant =
+    getObject(columnIndex, OffsetDateTime::class.java).toInstant().toKotlinInstant()
