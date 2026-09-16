@@ -11,6 +11,10 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import java.sql.Connection
 import java.util.*
 import kotlin.time.Clock
 import kotlin.time.Duration
@@ -35,8 +39,14 @@ public interface MessageQueue<T> {
         val maxTries: Int = 5,
         val securityCheckTimeout: Duration = 10.minutes,
         val processingTimeout: Duration = 1.minutes,
+        // Margin added to processingTimeout before another consumer may reclaim a lease, so that a
+        // worker's own processing timeout always fires first and requeues the message itself.
+        // Without it the two deadlines coincide and a reclaim can race an in-flight requeue.
+        val processingGrace: Duration = processingTimeout * .2,
     )
 }
+
+private val leaseExpiredNote: JsonElement = JsonObject(mapOf("cause" to JsonPrimitive("leaseExpired")))
 
 internal class MessageQueueImpl<T> internal constructor(
     override val name: String,
@@ -86,44 +96,97 @@ internal class MessageQueueImpl<T> internal constructor(
         }
     }
 
+    private class Candidate<T>(
+        val id: Uuid,
+        val payload: T,
+        val notes: JsonArray,
+        val startedAt: Instant?,
+    )
+
     override suspend fun tryReceive(): Message<T>? = withContext(Dispatchers.IO) {
         source().use { connection ->
-            connection.transaction {
-                val now = Clock.System.now()
-                val message = connection.prepareStatement(
-                    "SELECT id, payload, notes FROM ${tables.messages} WHERE queue = ? AND due_at <= ? AND started_at IS NULL AND json_array_length(notes) < ? ORDER BY due_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
-                ).use { statement ->
-                    statement.setString(1, name)
-                    statement.setInstant(2, Clock.System.now())
-                    statement.setInt(3, config.maxTries)
-                    statement.executeQuery().use { resultSet ->
-                        if (!resultSet.next()) return@withContext null
-                        val id = (resultSet.getObject(1) as UUID).toKotlinUuid()
-                        val payloadJson = resultSet.getString(2)
-                        val payload = Json.decodeFromString(serializer, payloadJson)
-                        val notesJson = resultSet.getString(3)
-                        val notes = Json.decodeFromString(JsonArray.serializer(), notesJson)
-                        MessageImpl(
-                            id = id,
-                            payload = payload,
-                            receivedAt = now,
-                            mqConfig = config,
-                            notes = notes,
-                            source = source,
-                            tables = tables,
-                            observers = messageObservers,
-                        )
-                    }
-                }
-                connection.prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
-                    statement.setInstant(1, Clock.System.now())
-                    statement.setObject(2, message.id.toJavaUuid())
-                    statement.executeUpdate()
-                }
-                message
-            }
+            connection.transaction { receiveNext() }
         }
     }
+
+    private fun Connection.receiveNext(): Message<T>? {
+        while (true) {
+            val now = Clock.System.now()
+            // A lease is only reclaimable once the holder's own processing timeout has had the
+            // grace margin to fire and requeue the message itself.
+            val reclaimableBefore = now - (config.processingTimeout + config.processingGrace)
+
+            val candidate = prepareStatement(
+                """
+                    SELECT id, payload, notes, started_at
+                    FROM ${tables.messages}
+                    WHERE
+                            queue = ?
+                        AND due_at <= ?
+                        AND (started_at IS NULL OR started_at < ?)
+                        AND json_array_length(notes) < ?
+                    ORDER BY due_at, id
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                """.trimIndent()
+            ).use { statement ->
+                statement.setString(1, name)
+                statement.setInstant(2, now)
+                statement.setInstant(3, reclaimableBefore)
+                statement.setInt(4, config.maxTries)
+                statement.executeQuery().use { resultSet ->
+                    if (!resultSet.next()) null
+                    else Candidate(
+                        id = (resultSet.getObject(1) as UUID).toKotlinUuid(),
+                        payload = Json.decodeFromString(serializer, resultSet.getString(2)),
+                        notes = Json.decodeFromString(JsonArray.serializer(), resultSet.getString(3)),
+                        startedAt = resultSet.getInstantOrNull(4),
+                    )
+                }
+            } ?: return null
+
+            if (candidate.startedAt == null) {
+                prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
+                    statement.setInstant(1, now)
+                    statement.setObject(2, candidate.id.toJavaUuid())
+                    statement.executeUpdate()
+                }
+                return message(candidate.id, candidate.payload, candidate.notes, now)
+            }
+
+            // An expired lease: the previous holder died without reporting, so this counts as a
+            // failed try, exactly as an explicit failureRequeue would.
+            val notes = JsonArray(candidate.notes + leaseExpiredNote)
+            if (notes.size >= config.maxTries) {
+                prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
+                    statement.setObject(1, candidate.id.toJavaUuid())
+                    statement.executeUpdate()
+                }
+                commit()
+                messageObservers.forEach { it.onFailure(candidate.id, candidate.payload, leaseExpiredNote) }
+                continue
+            }
+            prepareStatement("UPDATE ${tables.messages} SET started_at = ?, notes = ?::json WHERE id = ?").use { statement ->
+                statement.setInstant(1, now)
+                statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
+                statement.setObject(3, candidate.id.toJavaUuid())
+                statement.executeUpdate()
+            }
+            return message(candidate.id, candidate.payload, notes, now)
+        }
+    }
+
+    private fun message(id: Uuid, payload: T, notes: List<JsonElement>, now: Instant): Message<T> =
+        MessageImpl(
+            id = id,
+            payload = payload,
+            receivedAt = now,
+            mqConfig = config,
+            notes = notes,
+            source = source,
+            tables = tables,
+            observers = messageObservers,
+        )
 
     override suspend fun receive(): Message<T> =
         coroutineScope {

@@ -16,25 +16,34 @@ import kotlin.time.toKotlinInstant
 
 @OptIn(ExperimentalContracts::class)
 internal inline fun <R> Connection.transaction(
-    commit: Boolean = true,
     block: Connection.() -> R
 ): R {
     contract {
         callsInPlace(block, InvocationKind.EXACTLY_ONCE)
     }
+
     val previousAutoCommit = autoCommit
     autoCommit = false
-    try {
-        val ret = block()
-        if (commit) {
-            commit()
-        }
-        autoCommit = previousAutoCommit
-        return ret
+
+    var exception: Throwable? = null
+    return try {
+        block()
     } catch (e: Throwable) {
+        exception = e
         try { rollback() } catch (s: Throwable) { e.addSuppressed(s) }
-        try { autoCommit = previousAutoCommit } catch (s: Throwable) { e.addSuppressed(s) }
         throw e
+    } finally {
+        // Nested so that a failing commit still restores autoCommit, rather than handing a dirty
+        // connection back to the pool.
+        try {
+            if (exception == null) {
+                commit()
+            }
+        } finally {
+            try { autoCommit = previousAutoCommit } catch (s: Throwable) {
+                exception?.addSuppressed(s) ?: throw s
+            }
+        }
     }
 }
 
