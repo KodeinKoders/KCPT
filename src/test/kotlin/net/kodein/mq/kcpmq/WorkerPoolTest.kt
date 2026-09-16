@@ -26,7 +26,7 @@ class WorkerPoolTest : AbstractPgsqlTest() {
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).messageQueue(queue, User.serializer())
             (0..9).forEach { q.post(User(it, "u$it")) }
 
-            val poolJob = launch { q.workerPool { message -> message.successDelete() } }
+            val poolJob = launch { q.workerPool { null } }
             awaitUntil { dataSource.countMessages(prefix, queue) == 0 }
             poolJob.cancelAndJoin()
         }
@@ -48,7 +48,7 @@ class WorkerPoolTest : AbstractPgsqlTest() {
                     synchronized(this) { maxInFlight = maxOf(maxInFlight, current) }
                     releaseGate.withLock { }
                     inFlight.decrementAndGet()
-                    message.successDelete()
+                    null
                 }
             }
 
@@ -65,10 +65,10 @@ class WorkerPoolTest : AbstractPgsqlTest() {
     fun workerPoolRejectsKeepaliveNotLessThanTreatmentTimeout() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
-                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(messageTreatmentTimeout = 1.seconds))
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
 
             assertFailsWith<IllegalArgumentException> {
-                q.workerPool(workKeepalive = 1.seconds) { }
+                q.workerPool(keepalive = 1.seconds) { null }
             }
         }
     }
@@ -93,7 +93,7 @@ class WorkerPoolTest : AbstractPgsqlTest() {
                         throw RuntimeException("boom")
                     }
                     processed += message.payload.id
-                    message.successDelete()
+                    null
                 }
             }
 
@@ -112,17 +112,16 @@ class WorkerPoolTest : AbstractPgsqlTest() {
             val prefix = uniquePrefix()
             val queue = uniqueQueueName()
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .messageQueue(queue, User.serializer(), MessageQueue.Config(messageTreatmentTimeout = 500.milliseconds))
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 500.milliseconds))
             q.post(User(1, "slow"))
 
             val attempts = java.util.concurrent.atomic.AtomicInteger(0)
             val poolJob = launch {
-                q.workerPool(numberOfWorkers = 1, workTimeout = 500.milliseconds) { message ->
+                q.workerPool(numberOfWorkers = 1, timeout = 500.milliseconds) { message ->
                     if (attempts.incrementAndGet() == 1) {
                         delay(5.seconds) // exceeds workTimeout: should be requeued, not lost
-                    } else {
-                        message.successDelete()
                     }
+                    null
                 }
             }
 
@@ -143,7 +142,7 @@ class WorkerPoolTest : AbstractPgsqlTest() {
             val queue = uniqueQueueName()
             val treatmentTimeout = 1.seconds
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .messageQueue(queue, User.serializer(), MessageQueue.Config(messageTreatmentTimeout = treatmentTimeout))
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = treatmentTimeout))
             q.post(User(1, "A"))
 
             var messageId: kotlin.uuid.Uuid? = null
@@ -153,7 +152,7 @@ class WorkerPoolTest : AbstractPgsqlTest() {
                 q.workerPool { message ->
                     messageId = message.id
                     delay(2.seconds) // longer than messageTreatmentTimeout: keepalive should extend it
-                    message.successDelete()
+                    null
                 }
             }
 
@@ -177,15 +176,15 @@ class WorkerPoolTest : AbstractPgsqlTest() {
             val queue = uniqueQueueName()
             val treatmentTimeout = 1.seconds
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .messageQueue(queue, User.serializer(), MessageQueue.Config(messageTreatmentTimeout = treatmentTimeout))
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = treatmentTimeout))
             q.post(User(1, "A"))
 
             var messageId: kotlin.uuid.Uuid? = null
             val poolJob = launch {
-                q.workerPool(workTimeout = treatmentTimeout * 3, workKeepalive = treatmentTimeout / 3) { message ->
+                q.workerPool(timeout = treatmentTimeout * 3, keepalive = treatmentTimeout / 3) { message ->
                     messageId = message.id
                     delay(2500.milliseconds) // longer than treatmentTimeout, shorter than workTimeout
-                    message.successDelete()
+                    null
                 }
             }
 

@@ -20,7 +20,7 @@ class MessageLeaseTest : AbstractPgsqlTest() {
     fun unacknowledgedMessageBecomesAvailableAgainAfterTreatmentTimeout() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
-                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(messageTreatmentTimeout = 500.milliseconds))
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 500.milliseconds))
             q.post(User(1, "A"))
 
             val firstAttempt = q.tryReceive()
@@ -39,7 +39,7 @@ class MessageLeaseTest : AbstractPgsqlTest() {
     fun receiveReclaimsAnExpiredLease() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
-                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(messageTreatmentTimeout = 500.milliseconds))
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 500.milliseconds))
             q.post(User(1, "A"))
             q.tryReceive() // pick it up and abandon it
 
@@ -55,7 +55,7 @@ class MessageLeaseTest : AbstractPgsqlTest() {
         withContext(Dispatchers.Default) {
             val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
             val queue = uniqueQueueName()
-            val config = MessageQueue.Config(messageTreatmentTimeout = 500.milliseconds)
+            val config = MessageQueue.Config(processingTimeout = 500.milliseconds)
             val consumerA = sink.messageQueue(queue, User.serializer(), config)
             val consumerB = sink.messageQueue(queue, User.serializer(), config)
             consumerA.post(User(1, "A"))

@@ -1,16 +1,11 @@
 package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonElement
 import kotlin.time.Duration
 
 
@@ -18,11 +13,11 @@ import kotlin.time.Duration
 public suspend fun <T> MessageQueue<T>.workerPool(
     numberOfThreads: Int = Runtime.getRuntime().availableProcessors(),
     numberOfWorkers: Int = numberOfThreads * 4,
-    workTimeout: Duration = config.messageTreatmentTimeout,
-    workKeepalive: Duration = config.messageTreatmentTimeout * .6,
-    work: suspend (Message<T>) -> Unit
+    timeout: Duration = config.processingTimeout,
+    keepalive: Duration? = if (timeout > config.processingTimeout) config.processingTimeout * .6 else null,
+    process: suspend (Message<T>) -> JsonElement?
 ): Nothing {
-    require(workKeepalive < config.messageTreatmentTimeout) { "Work keepalive must be less than message treatment timeout" }
+    require(keepalive == null || keepalive < config.processingTimeout) { "Worker pool keepalive must be less than message queue processing timeout" }
     newFixedThreadPoolContext(numberOfThreads, "KCPMQ-WorkerPool").use { dispatcher ->
         val semaphore = Semaphore(numberOfWorkers)
         coroutineScope {
@@ -36,11 +31,10 @@ public suspend fun <T> MessageQueue<T>.workerPool(
                     }
                 launch(dispatcher) {
                     try {
-                        workMessage(
-                            message = message,
-                            workTimeout = workTimeout,
-                            workKeepalive = if (workTimeout > config.messageTreatmentTimeout) workKeepalive else null,
-                            work = work
+                        message.process(
+                            timeout = timeout,
+                            keepalive = keepalive,
+                            process = process
                         )
                     } finally {
                         semaphore.release()
@@ -48,26 +42,5 @@ public suspend fun <T> MessageQueue<T>.workerPool(
                 }
             }
         }
-    }
-}
-
-private suspend fun <T> workMessage(
-    message: Message<T>,
-    workTimeout: Duration,
-    workKeepalive: Duration?,
-    work: suspend (Message<T>) -> Unit
-) {
-    withTimeoutOrNull(workTimeout) {
-        val keepAliveJob =
-            if (workKeepalive != null) {
-                launch(Dispatchers.Unconfined) {
-                    while (true) {
-                        delay(workKeepalive)
-                        message.extend()
-                    }
-                }
-            } else null
-        work(message)
-        keepAliveJob?.cancelAndJoin()
     }
 }

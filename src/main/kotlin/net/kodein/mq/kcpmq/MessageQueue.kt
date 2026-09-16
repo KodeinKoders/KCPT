@@ -34,7 +34,7 @@ public interface MessageQueue<T> {
     public data class Config(
         val maxTries: Int = 5,
         val securityCheckTimeout: Duration = 10.minutes,
-        val messageTreatmentTimeout: Duration = 1.minutes,
+        val processingTimeout: Duration = 1.minutes,
     )
 }
 
@@ -89,6 +89,7 @@ internal class MessageQueueImpl<T> internal constructor(
     override suspend fun tryReceive(): Message<T>? = withContext(Dispatchers.IO) {
         source().use { connection ->
             connection.transaction {
+                val now = Clock.System.now()
                 val message = connection.prepareStatement(
                     "SELECT id, payload, notes FROM ${tables.messages} WHERE queue = ? AND due_at <= ? AND started_at IS NULL AND json_array_length(notes) < ? ORDER BY due_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
                 ).use { statement ->
@@ -105,8 +106,9 @@ internal class MessageQueueImpl<T> internal constructor(
                         MessageImpl(
                             id = id,
                             payload = payload,
+                            receivedAt = now,
+                            mqConfig = config,
                             notes = notes,
-                            maxTries = config.maxTries,
                             source = source,
                             tables = tables,
                             observers = messageObservers,

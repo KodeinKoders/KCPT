@@ -2,10 +2,25 @@
 
 package net.kodein.mq.kcpmq
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Clock
+import kotlin.time.Duration
 import kotlin.time.Instant
 import kotlin.uuid.Uuid
 import kotlin.uuid.toJavaUuid
@@ -14,6 +29,8 @@ import kotlin.uuid.toJavaUuid
 public interface Message<T> {
     public val id: Uuid
     public val payload: T
+    public val receivedAt: Instant
+    public val expiresAt: Instant
     public val notes: List<JsonElement>
     public suspend fun successDelete(notes: JsonElement = JsonNull)
     public suspend fun failureDelete(notes: JsonElement = JsonNull)
@@ -29,12 +46,16 @@ public interface Message<T> {
 internal class MessageImpl<T>(
     override val id: Uuid,
     override val payload: T,
+    override val receivedAt: Instant,
+    private val mqConfig: MessageQueue.Config,
     override val notes: List<JsonElement>,
-    private val maxTries: Int,
     private val source: Source,
     private val tables: MQTables,
     private val observers: List<Message.Observer<T>> = emptyList(),
 ) : Message<T> {
+
+    override var expiresAt: Instant = receivedAt + mqConfig.processingTimeout
+        private set
 
     override suspend fun successDelete(notes: JsonElement) {
         source().use { connection ->
@@ -48,7 +69,7 @@ internal class MessageImpl<T>(
 
     override suspend fun failureRequeue(due: Instant?, notes: JsonElement) {
         val updatedNotes = JsonArray(this.notes + notes)
-        if (updatedNotes.size >= maxTries) {
+        if (updatedNotes.size >= mqConfig.maxTries) {
             failureDelete(notes)
             return
         }
@@ -75,10 +96,84 @@ internal class MessageImpl<T>(
 
     override suspend fun extend() {
         source().use { connection ->
+            val now = Clock.System.now()
             connection.prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
-                statement.setInstant(1, Clock.System.now())
+                statement.setInstant(1, now)
                 statement.setObject(2, id.toJavaUuid())
                 statement.executeUpdate()
+            }
+            expiresAt = now + mqConfig.processingTimeout
+        }
+    }
+}
+
+public sealed class MessageProcessingFailure {
+    public abstract fun defaultNotes(): Map<String, JsonElement>
+
+    public data class Exception(public val exception: Throwable) : MessageProcessingFailure() {
+        override fun defaultNotes(): Map<String, JsonElement> =
+            mapOf(
+                "cause" to JsonPrimitive("exception"),
+                "exceptionMessage" to JsonPrimitive(exception.message),
+                "exceptionType" to JsonPrimitive(exception::class.qualifiedName),
+                "exceptionStackTrace" to JsonPrimitive(exception.stackTraceToString()),
+            )
+    }
+    public data class Timeout(public val timeout: Duration) : MessageProcessingFailure() {
+        override fun defaultNotes(): Map<String, JsonElement> =
+            mapOf(
+                "cause" to JsonPrimitive("timeout"),
+                "timeoutMs" to JsonPrimitive(timeout.inWholeMilliseconds),
+            )
+    }
+    public data class Cancellation(val cancelledFromWork: Boolean) : MessageProcessingFailure() {
+        override fun defaultNotes(): Map<String, JsonElement> =
+            mapOf(
+                "cause" to JsonPrimitive("cancellation"),
+                "from" to JsonPrimitive(if (cancelledFromWork) "work" else "parent"),
+            )
+    }
+}
+
+public suspend fun <T> Message<T>.process(
+    timeout: Duration = this.expiresAt - Clock.System.now(),
+    keepalive: Duration? = null,
+    onFailure: (failure: MessageProcessingFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
+    process: suspend (Message<T>) -> JsonElement?
+) {
+    require(keepalive == null || keepalive < timeout) { "Keepalive must be less than message processing timeout" }
+    coroutineScope {
+        try {
+            withTimeout(timeout) {
+                val keepAliveJob =
+                    if (keepalive != null) {
+                        launch(Dispatchers.Unconfined) {
+                            while (true) {
+                                delay(keepalive)
+                                extend()
+                            }
+                        }
+                    } else null
+                val notes = process(this@process)
+                successDelete(notes ?: JsonNull)
+                keepAliveJob?.cancelAndJoin()
+                true
+            }
+        } catch (_: TimeoutCancellationException) {
+            withContext(NonCancellable) {
+                failureRequeue(notes = onFailure(MessageProcessingFailure.Timeout(timeout)))
+            }
+        } catch (_: CancellationException) {
+            // Read before entering NonCancellable: NonCancellable is an always-active Job that
+            // would shadow this scope's Job and make isActive always report true.
+            val cancelledFromWork = isActive
+            withContext(NonCancellable) {
+                failureRequeue(notes = onFailure(MessageProcessingFailure.Cancellation(cancelledFromWork)))
+            }
+            ensureActive()
+        } catch (t: Throwable) {
+            withContext(NonCancellable) {
+                failureRequeue(notes = onFailure(MessageProcessingFailure.Exception(t)))
             }
         }
     }
