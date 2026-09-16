@@ -1,12 +1,12 @@
 package net.kodein.mq.kcpmq
 
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.serialization.KSerializer
-import net.kodein.mq.kcpmq.Message
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 
@@ -46,43 +46,54 @@ internal class MessageQueueSinkImpl(
         messages = "${tablesPrefix}messages",
     )
 
-    private val initJobRef: AtomicReference<Job?> = AtomicReference(null)
+    // Lazy initialisation is shared by every caller, so it must not run in whichever caller's
+    // scope happened to get there first: cancelling that caller would cancel the migration and
+    // leave every other waiter with a cancellation that was never theirs. A one-shot migration
+    // holds nothing once it finishes, so this scope is never torn down.
+    private val initScope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private val initRef: AtomicReference<Deferred<Unit>?> = AtomicReference(null)
 
     init {
         require(tables.messages.isNotEmpty()) { "Table name cannot be empty" }
         if (initializationScope != null) {
-            initJobRef.store(
-                initializationScope.launch {
-                    // No need to use [initialize] since there cannot be construction race conditions.
-                    context(tables) {
-                        Setup.initializeMQSchema(source)
-                    }
-                }
+            // Eager initialisation is owned by the scope the caller handed over, so it stays a
+            // child of it: they decide its lifetime, and awaiting that scope awaits this.
+            // No need to use [initialize] since there cannot be construction race conditions.
+            initRef.store(
+                initializationScope.async { context(tables) { Setup.initializeMQSchema(source) } }
             )
         }
     }
 
     override suspend fun initialize() {
-        val initJob = initJobRef.load()
-        if (initJob != null) {
-            initJob.join()
-            return
+        initRef.load()?.let { return awaitInit(it) }
+
+        val candidate = initScope.async(start = CoroutineStart.LAZY) {
+            context(tables) { Setup.initializeMQSchema(source) }
         }
-        coroutineScope {
-            val first = CompletableDeferred<Job?>()
-            val job = launch {
-                val first = first.await()
-                if (first != null) {
-                    // Another job was first
-                    first.join()
-                    return@launch
-                }
-                // This job is first
-                context(tables) {
-                    Setup.initializeMQSchema(source)
-                }
-            }
-            first.complete(initJobRef.compareAndExchange(null, job))
+        val winner = initRef.compareAndExchange(null, candidate)
+        if (winner != null) {
+            candidate.cancel()
+            return awaitInit(winner)
+        }
+        candidate.start()
+        return awaitInit(candidate)
+    }
+
+    // Job.join() reports nothing: it returns just as happily for a job that failed as for one that
+    // succeeded, which is how a failed migration used to be remembered as a success. Deferred
+    // propagates instead.
+    private suspend fun awaitInit(deferred: Deferred<Unit>) {
+        try {
+            deferred.await()
+        } catch (t: Throwable) {
+            // Forget a failed initialisation so a later caller can retry — caching it would let one
+            // transient outage poison the sink for the life of the process. But if the deferred is
+            // still running, it was this caller that was cancelled, not the initialisation, and the
+            // work others are waiting on must be left alone.
+            if (!deferred.isActive) initRef.compareAndSet(deferred, null)
+            throw t
         }
     }
 

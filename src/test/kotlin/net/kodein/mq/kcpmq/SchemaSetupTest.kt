@@ -2,10 +2,12 @@ package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
@@ -149,6 +151,51 @@ class SchemaSetupTest : AbstractPgsqlTest() {
 
         assertFailsWith<Exception> { sink.initialize() }
         assertFailsWith<Exception> { sink.initialize() }
+    }
+
+    // A failure must not be cached either way: not as a success, and not as a permanent failure —
+    // one transient outage would otherwise poison the sink for the life of the process.
+    @Test
+    fun initializeRetriesAfterAFailure() = runTest(timeout = 5.seconds) {
+        val schema = "late_${uniquePrefix().substringAfter("public.").trimEnd('_')}"
+        val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = "$schema.mq_")
+
+        assertFailsWith<Exception> { sink.initialize() }
+
+        // The cause is now fixed, exactly as an operator restoring a database would.
+        dataSource.connection.use { connection ->
+            connection.createStatement().use { it.execute("CREATE SCHEMA $schema") }
+        }
+
+        sink.initialize()
+
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("SELECT value FROM $schema.mq_properties WHERE key = 'schema_version'").use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    assertTrue(resultSet.next())
+                    assertEquals("1", resultSet.getString(1))
+                }
+            }
+        }
+    }
+
+    // Initialisation is shared, so it must not belong to whichever caller reached it first.
+    @Test
+    fun cancellingTheFirstCallerDoesNotBreakInitialisationForOthers() = runTest(timeout = 5.seconds) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+
+            val firstCaller = launch { sink.initialize() }
+            firstCaller.cancel()
+            firstCaller.join()
+
+            // A second caller must still end up with a usable schema.
+            sink.initialize()
+            val mq = sink.messageQueue(uniqueQueueName(), User.serializer())
+            mq.post(User(1, "A"))
+            assertNotNull(mq.tryReceive())
+        }
     }
 
     @Test
