@@ -54,16 +54,31 @@ internal object Setup {
         )
     )
 
+    // A database-wide key, so every process initialising the same tables contends on the same
+    // lock. String.hashCode is specified by the JDK, so separate JVMs derive the same value.
+    context(tables: MQTables)
+    private fun advisoryLockKey(): Long = "kcpmq:${tables.messages}".hashCode().toLong()
+
     context(tables: MQTables)
     internal suspend fun initializeMQSchema(source: Source): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
-            initializePropertiesTable(connection)
-            val targetVersion = mqMigrations.size
-            var currentVersion = connection.getProperty(Property.SchemaVersion) ?: 0
-            if (currentVersion == targetVersion) return@withContext
+            connection.transaction {
+                // Reading the version and acting on it is a check-then-act across sessions, so it
+                // needs to be exclusive database-wide: the per-sink init Job only covers one
+                // instance. Without this, two processes starting together both read version 0 and
+                // both run the migration, and the loser fails on an already-created table —
+                // CREATE TABLE IF NOT EXISTS is not atomic against a concurrent creator either.
+                // The lock is transaction-scoped, so it is released by the commit or rollback.
+                prepareStatement("SELECT pg_advisory_xact_lock(?)").use { statement ->
+                    statement.setLong(1, advisoryLockKey())
+                    statement.execute()
+                }
 
-            while (currentVersion < targetVersion) {
-                connection.transaction {
+                initializePropertiesTable(connection)
+                val targetVersion = mqMigrations.size
+                var currentVersion = getProperty(Property.SchemaVersion) ?: 0
+
+                while (currentVersion < targetVersion) {
                     mqMigrations[currentVersion].forEach { statement ->
                         prepareStatement(statement.sql(tables).trimIndent()).use {
                             statement.conf(tables, it)

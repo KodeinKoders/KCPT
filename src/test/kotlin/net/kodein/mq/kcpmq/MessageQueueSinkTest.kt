@@ -98,9 +98,9 @@ class MessageQueueSinkTest : AbstractPgsqlTest() {
         assertEquals(listOf("sink", "queue"), order)
     }
 
-    // [FAIL] MQConnection.kt's MQTables.named uses Utils.escapeLiteral (a string-literal escaper)
-    // on the tablesPrefix, not an identifier allowlist — a prefix containing SQL metacharacters
-    // should be rejected, not silently produce broken/injectable DDL.
+    // [FAIL bug 11] MQConnection.kt's MQTables.named uses Utils.escapeLiteral (a string-literal
+    // escaper) on the tablesPrefix, not an identifier allowlist — a prefix containing SQL
+    // metacharacters should be rejected, not silently produce broken/injectable DDL.
     @Test
     fun tablesPrefixWithSqlMetacharactersIsRejected() = runTest(timeout = 5.seconds) {
         assertFailsWith<IllegalArgumentException> {
