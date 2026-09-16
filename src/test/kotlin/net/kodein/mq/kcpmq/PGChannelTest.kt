@@ -58,8 +58,6 @@ class PGChannelTest : AbstractPgsqlTest() {
         }.join()
     }
 
-    // [GUARD] regression guard for the LISTEN-quoting fix — a dotted, mixed-case channel name
-    // used to fail with a Postgres syntax error.
     @Test
     fun channelNameWithDotAndMixedCaseRoundTrips() = runTest(timeout = 5.seconds) {
         val channel = PGChannel("MySchema.Foos_${uniqueQueueName()}", Foo.serializer())
@@ -94,8 +92,6 @@ class PGChannelTest : AbstractPgsqlTest() {
         }
     }
 
-    // [GUARD] regression guard for the pg_notify-before-commit race fix — a notification sent
-    // inside a still-open transaction must not be delivered until that transaction commits.
     @Test
     fun notifyIsNotDeliveredUntilTheTransactionCommits() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {
@@ -163,7 +159,6 @@ class PGChannelTest : AbstractPgsqlTest() {
         assertFailsWith<IllegalArgumentException> { PGChannel(tooLong, Foo.serializer()) }
     }
 
-    // [GUARD] regression guard for the connection-leak fix in openListenConnection/ConnectionFlow.
     @Test
     fun closingTheConnectionFlowReleasesTheConnection() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
@@ -178,7 +173,6 @@ class PGChannelTest : AbstractPgsqlTest() {
         }
     }
 
-    // [GUARD]
     @Test
     fun closeAndJoinReleasesTheConnectionSynchronously() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {

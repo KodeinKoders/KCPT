@@ -74,7 +74,6 @@ class MessageQueuePostTryReceiveTest : AbstractPgsqlTest() {
         assertTrue(dueAt >= before - 1.seconds && dueAt <= after + 1.seconds)
     }
 
-    // [GUARD] regression guard for the previously-inverted `due_at >= NOW()` bug.
     @Test
     fun postWithFutureDueIsNotReceivedYet() = runTest(timeout = 5.seconds) {
         val q = mq()
@@ -83,7 +82,6 @@ class MessageQueuePostTryReceiveTest : AbstractPgsqlTest() {
         assertNull(q.tryReceive())
     }
 
-    // [GUARD]
     @Test
     fun postWithPastDueIsReceivedImmediately() = runTest(timeout = 5.seconds) {
         val q = mq()
@@ -147,14 +145,6 @@ class MessageQueuePostTryReceiveTest : AbstractPgsqlTest() {
         assertNotNull(b.tryReceive())
     }
 
-    // bug 1 (documented in the plan): tryReceive's SELECT (MessageQueue.kt) has no ORDER BY, so
-    // due-order delivery is not actually guaranteed by the code. Empirically this test currently
-    // PASSES on a small table, because the planner happens to use the partial due_at index for
-    // this LIMIT 1 query shape, which incidentally returns rows in due_at order. That is a
-    // planner implementation detail, not a contract — nothing in MessageQueue.kt asks for this
-    // order, so it is not safe to rely on (a larger table, a different Postgres version, or a
-    // planner that chooses a seq scan could all return a different order). Left unmarked (passing)
-    // since it does not currently fail, but see the equal-due_at test below for a case that does.
     @Test
     fun messagesAreDeliveredInDueAtOrder() = runTest(timeout = 5.seconds) {
         val q = mq()
@@ -169,10 +159,6 @@ class MessageQueuePostTryReceiveTest : AbstractPgsqlTest() {
         assertEquals(listOf(0, 1, 2, 3, 4), received)
     }
 
-    // [FAIL bug 1] Same root cause as above (no ORDER BY in tryReceive's SELECT), but forced with
-    // identical due_at values so the partial due_at index gives the planner no ordering signal at
-    // all — a real queue should still break the tie by insertion/id order (UUIDv7 is monotonic),
-    // but nothing in the code asks for that either.
     @Test
     fun messagesWithEqualDueAtAreDeliveredInPostOrder() = runTest(timeout = 5.seconds) {
         val q = mq()

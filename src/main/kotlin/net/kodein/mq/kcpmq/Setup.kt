@@ -46,7 +46,7 @@ internal object Setup {
                     // language="PostgreSQL"
                     """
                         CREATE INDEX
-                        ON $messages (due_at)
+                        ON $messages (queue, due_at)
                         WHERE started_at IS NULL
                     """
                 },

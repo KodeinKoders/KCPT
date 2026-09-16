@@ -90,7 +90,7 @@ internal class MessageQueueImpl<T> internal constructor(
         source().use { connection ->
             connection.transaction {
                 val message = connection.prepareStatement(
-                    "SELECT id, payload, notes FROM ${tables.messages} WHERE queue = ? AND due_at <= ? AND started_at IS NULL AND json_array_length(notes) < ? LIMIT 1 FOR UPDATE SKIP LOCKED"
+                    "SELECT id, payload, notes FROM ${tables.messages} WHERE queue = ? AND due_at <= ? AND started_at IS NULL AND json_array_length(notes) < ? ORDER BY due_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
                 ).use { statement ->
                     statement.setString(1, name)
                     statement.setInstant(2, Clock.System.now())

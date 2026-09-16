@@ -82,7 +82,6 @@ class MessageAckTest : AbstractPgsqlTest() {
         assertEquals(1, dataSource.countMessages(prefix, queue))
     }
 
-    // [GUARD] regression guard for the started_at = NULL fix in failureRequeue.
     @Test
     fun failureRequeueMakesMessageReceivableAgain() = runTest(timeout = 5.seconds) {
         val (q, _) = mqWithObserver(MessageQueue.Config(maxTries = 5))

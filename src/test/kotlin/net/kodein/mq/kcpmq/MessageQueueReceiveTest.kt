@@ -32,7 +32,6 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
         }
     }
 
-    // [GUARD] regression guard for the coroutineScope/shareIn hang fixed earlier this session.
     @Test
     fun receiveWakesUpWhenAMessageIsPosted() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {
@@ -115,8 +114,6 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
         }
     }
 
-    // [GUARD] regression guard for the ConnectionFlow cleanup fix — cancelling receive() must
-    // release its LISTEN connection back to the pool.
     @Test
     fun receiveIsCancellableAndReleasesItsListenConnection() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {
@@ -134,7 +131,7 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
         }
     }
 
-    // [GUARD] Uses a short securityCheckTimeout: if a given iteration loses the inherently-timed
+    // Uses a short securityCheckTimeout: if a given iteration loses the inherently-timed
     // LISTEN-vs-NOTIFY race (the 150ms head start below is generous but not a hard guarantee),
     // receive() should self-heal within a couple of seconds via the min(due_at) fallback rather
     // than sit on the default 10-minute securityCheckTimeout, which would look like a hang.
