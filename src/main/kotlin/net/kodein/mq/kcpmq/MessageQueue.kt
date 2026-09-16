@@ -52,7 +52,6 @@ internal class MessageQueueImpl<T> internal constructor(
     private val channel = PGChannel(
         name = "${tables.messages}_$name",
         serializer = Instant.serializer(),
-        source = source,
     )
 
     @OptIn(ExperimentalUuidApi::class)
@@ -66,23 +65,23 @@ internal class MessageQueueImpl<T> internal constructor(
         withContext(Dispatchers.IO) {
             source().use { connection ->
                 connection.transaction {
-                    connection.prepareStatement("""
-                    INSERT INTO ${tables.messages}
-                    (
-                        queue,
-                        id,
-                        due_at,
-                        payload
-                    )
-                    VALUES (?, ?, ?, ?::json)
-                """.trimIndent()).use { statement ->
-                        statement.setString(1, name)
-                        statement.setObject(2, id.toJavaUuid())
-                        statement.setInstant(3, dueAt)
-                        statement.setString(4, serializedValue)
-                        statement.executeUpdate()
-                    }
-                    channel.notify(dueAt)
+                    prepareStatement("""
+                        INSERT INTO ${tables.messages}
+                        (
+                            queue,
+                            id,
+                            due_at,
+                            payload
+                        )
+                        VALUES (?, ?, ?, ?::json)
+                    """.trimIndent()).use { statement ->
+                            statement.setString(1, name)
+                            statement.setObject(2, id.toJavaUuid())
+                            statement.setInstant(3, dueAt)
+                            statement.setString(4, serializedValue)
+                            statement.executeUpdate()
+                        }
+                    notify(channel, dueAt)
                 }
             }
         }
@@ -92,10 +91,11 @@ internal class MessageQueueImpl<T> internal constructor(
         source().use { connection ->
             connection.transaction {
                 val message = connection.prepareStatement(
-                    "SELECT id, payload, notes FROM ${tables.messages} WHERE queue = ? AND due_at <= NOW() AND started_at IS NULL AND json_array_length(notes) < ? LIMIT 1 FOR UPDATE SKIP LOCKED"
+                    "SELECT id, payload, notes FROM ${tables.messages} WHERE queue = ? AND due_at <= ? AND started_at IS NULL AND json_array_length(notes) < ? LIMIT 1 FOR UPDATE SKIP LOCKED"
                 ).use { statement ->
                     statement.setString(1, name)
-                    statement.setInt(2, config.maxTries)
+                    statement.setInstant(2, Clock.System.now())
+                    statement.setInt(3, config.maxTries)
                     statement.executeQuery().use { resultSet ->
                         if (!resultSet.next()) return@withContext null
                         val id = (resultSet.getObject(1) as UUID).toKotlinUuid()
@@ -126,7 +126,7 @@ internal class MessageQueueImpl<T> internal constructor(
 
     override suspend fun receive(): Message<T> =
         coroutineScope {
-            val flow = channel.openListenConnection(this)
+            val flow = source.openListenConnection(this, channel)
             var message: Message<T>?
             do {
                 message = tryReceive()
@@ -138,8 +138,8 @@ internal class MessageQueueImpl<T> internal constructor(
                             statement.setString(1, name)
                             statement.setInt(2, config.maxTries)
                             statement.executeQuery().use { resultSet ->
-                                if (resultSet.next()) resultSet.getInstant(1)
-                                else null
+                                resultSet.next()
+                                resultSet.getInstantOrNull(1)
                             }
                         }
                     } ?: run {

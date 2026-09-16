@@ -15,12 +15,12 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import org.postgresql.PGConnection
 import org.postgresql.core.Utils
+import java.sql.Connection
 
 
 public class PGChannel<T>(
     public val name: String,
     private val serializer: KSerializer<T>,
-    private val source: Source,
 ) {
     private val quotedName: String = Utils.escapeIdentifier(null, name).toString()
 
@@ -31,7 +31,7 @@ public class PGChannel<T>(
         }
     }
 
-    public suspend fun openListenConnection(scope: CoroutineScope): Flow<T> {
+    public suspend fun openListenConnection(scope: CoroutineScope, source: Source): Flow<T> {
         val connection = source()
         scope.coroutineContext[Job]!!.invokeOnCompletion { connection.close() }
 
@@ -55,14 +55,18 @@ public class PGChannel<T>(
             .shareIn(scope, SharingStarted.WhileSubscribed())
     }
 
-    public suspend fun notify(value: T): Unit =
+    public suspend fun notify(connection: Connection, value: T): Unit =
         withContext(Dispatchers.IO) {
-            source().use { connection ->
-                connection.prepareStatement("SELECT pg_notify(?, ?)").use { statement ->
-                    statement.setString(1, name)
-                    statement.setString(2, mqJson.encodeToString(serializer, value))
-                    statement.execute()
-                }
+            connection.prepareStatement("SELECT pg_notify(?, ?)").use { statement ->
+                statement.setString(1, name)
+                statement.setString(2, mqJson.encodeToString(serializer, value))
+                statement.execute()
             }
         }
 }
+
+public suspend fun <T> Connection.notify(channel: PGChannel<T>, value: T): Unit =
+    channel.notify(this, value)
+
+public suspend fun <T> Source.openListenConnection(scope: CoroutineScope, channel: PGChannel<T>): Flow<T> =
+    channel.openListenConnection(scope, this)

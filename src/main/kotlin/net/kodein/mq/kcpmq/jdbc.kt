@@ -45,5 +45,5 @@ internal fun PreparedStatement.setInstant(parameterIndex: Int, value: Instant) {
     setObject(parameterIndex, value.toJavaInstant().atOffset(ZoneOffset.UTC))
 }
 
-internal fun ResultSet.getInstant(columnIndex: Int): Instant =
-    getObject(columnIndex, OffsetDateTime::class.java).toInstant().toKotlinInstant()
+internal fun ResultSet.getInstantOrNull(columnIndex: Int): Instant? =
+    getObject(columnIndex, OffsetDateTime::class.java)?.toInstant()?.toKotlinInstant()

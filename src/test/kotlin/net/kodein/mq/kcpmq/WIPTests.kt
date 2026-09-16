@@ -25,15 +25,17 @@ class ChannelsTests : AbstractPgsqlTest() {
 
     @Test
     fun testPublishAndReceive(): Unit = runTest(timeout = 5.seconds) {
-        val channel = PGChannel<Foo>("myschema.foos", Foo.serializer(), dataSource.asSource())
+        val channel = PGChannel<Foo>("myschema.foos", Foo.serializer())
 
         launch {
-            val flow = channel.openListenConnection(this)
+            val flow = dataSource.asSource().openListenConnection(this, channel)
             val job = launch {
                 assertEquals(Foo("bar"), flow.first())
             }
 
-            channel.notify(Foo("bar"))
+            dataSource.connection.use { connection ->
+                connection.notify(channel, Foo("bar"))
+            }
             job.join()
 
             cancel()

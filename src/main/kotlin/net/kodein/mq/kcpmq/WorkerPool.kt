@@ -1,8 +1,11 @@
 package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
 import kotlinx.coroutines.supervisorScope
@@ -16,7 +19,7 @@ public suspend fun <T> MessageQueue<T>.workerPool(
     numberOfThreads: Int = Runtime.getRuntime().availableProcessors(),
     numberOfWorkers: Int = numberOfThreads * 4,
     workTimeout: Duration = config.messageTreatmentTimeout,
-    workKeepalive: Duration = config.messageTreatmentTimeout * .8,
+    workKeepalive: Duration = config.messageTreatmentTimeout * .6,
     work: suspend (Message<T>) -> Unit
 ): Nothing {
     require(workKeepalive < config.messageTreatmentTimeout) { "Work keepalive must be less than message treatment timeout" }
@@ -55,6 +58,16 @@ private suspend fun <T> workMessage(
     work: suspend (Message<T>) -> Unit
 ) {
     withTimeoutOrNull(workTimeout) {
-
+        val keepAliveJob =
+            if (workKeepalive != null) {
+                launch(Dispatchers.Unconfined) {
+                    while (true) {
+                        delay(workKeepalive)
+                        message.extend()
+                    }
+                }
+            } else null
+        work(message)
+        keepAliveJob?.cancelAndJoin()
     }
 }
