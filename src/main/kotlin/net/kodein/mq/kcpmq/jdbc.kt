@@ -39,6 +39,9 @@ internal inline fun <R> Connection.transaction(
             if (exception == null) {
                 commit()
             }
+        } catch (e: Throwable) {
+            exception = e
+            throw e
         } finally {
             try { autoCommit = previousAutoCommit } catch (s: Throwable) {
                 exception?.addSuppressed(s) ?: throw s
