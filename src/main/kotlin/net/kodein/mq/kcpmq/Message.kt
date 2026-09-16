@@ -30,7 +30,7 @@ internal class MessageImpl<T>(
     override val id: Uuid,
     override val payload: T,
     override val notes: List<JsonElement>,
-    private val allowRequeue: Boolean,
+    private val maxTries: Int,
     private val source: Source,
     private val tables: MQTables,
     private val observers: List<Message.Observer<T>> = emptyList(),
@@ -47,7 +47,8 @@ internal class MessageImpl<T>(
     }
 
     override suspend fun failureRequeue(due: Instant?, notes: JsonElement) {
-        if (!allowRequeue) {
+        val updatedNotes = JsonArray(this.notes + notes)
+        if (updatedNotes.size >= maxTries) {
             failureDelete(notes)
             return
         }
@@ -55,7 +56,7 @@ internal class MessageImpl<T>(
         source().use { connection ->
             connection.prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
                 statement.setInstant(1, due ?: Clock.System.now())
-                statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), JsonArray(this.notes + notes)))
+                statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), updatedNotes))
                 statement.setObject(3, id.toJavaUuid())
                 statement.executeUpdate()
             }

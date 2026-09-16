@@ -106,7 +106,7 @@ internal class MessageQueueImpl<T> internal constructor(
                             id = id,
                             payload = payload,
                             notes = notes,
-                            allowRequeue = notes.size < config.maxTries,
+                            maxTries = config.maxTries,
                             source = source,
                             tables = tables,
                             observers = messageObservers,
