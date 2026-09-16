@@ -61,7 +61,11 @@ internal class MessageImpl<T>(
     override var expiresAt: Instant = receivedAt + mqConfig.processingTimeout
         private set
 
-    override suspend fun successDelete(notes: JsonElement) {
+    // Source only moves connection *acquisition* to Dispatchers.IO, so without this the blocking
+    // statement would run on whichever dispatcher the caller is on: a core-count-limited pool it
+    // can starve, a single thread it can freeze, or — via process()'s Unconfined keepalive — the
+    // shared timer thread, where it would hold up every delay() in the process.
+    override suspend fun successDelete(notes: JsonElement): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
             connection.prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
                 statement.setObject(1, id.toJavaUuid())
@@ -71,11 +75,11 @@ internal class MessageImpl<T>(
         observers.forEach { it.onSuccess(id, payload, notes) }
     }
 
-    override suspend fun failureRequeue(due: Instant?, notes: JsonElement) {
-        val updatedNotes = JsonArray(this.notes + notes)
+    override suspend fun failureRequeue(due: Instant?, notes: JsonElement): Unit = withContext(Dispatchers.IO) {
+        val updatedNotes = JsonArray(this@MessageImpl.notes + notes)
         if (updatedNotes.size >= mqConfig.maxTries) {
             failureDelete(notes)
-            return
+            return@withContext
         }
 
         source().use { connection ->
@@ -88,7 +92,7 @@ internal class MessageImpl<T>(
         }
     }
 
-    override suspend fun failureDelete(notes: JsonElement) {
+    override suspend fun failureDelete(notes: JsonElement): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
             connection.prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
                 statement.setObject(1, id.toJavaUuid())
@@ -98,7 +102,7 @@ internal class MessageImpl<T>(
         observers.forEach { it.onFailure(id, payload, notes) }
     }
 
-    override suspend fun extend() {
+    override suspend fun extend(): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
             val now = Clock.System.now()
             connection.prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->

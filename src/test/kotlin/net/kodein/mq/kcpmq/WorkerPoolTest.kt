@@ -132,43 +132,59 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
-    // [FAIL bug 4] the default workTimeout equals messageTreatmentTimeout exactly, so
-    // WorkerPool.kt's `workTimeout > config.messageTreatmentTimeout` check is false and the
-    // keepalive is silently disabled even though workKeepalive was computed and validated.
+    // Under default settings no keepalive is needed, and none is configured: timeout equals
+    // processingTimeout, so the worker's own withTimeout fires and requeues the message a whole
+    // processingGrace before a reclaim could take it. Work that overruns is therefore handed back
+    // rather than extended, and never processed twice.
     @Test
-    fun keepaliveIsActiveWithDefaultSettings() = runTest(timeout = 8.seconds) {
+    fun workThatOverrunsIsRequeuedRatherThanExtendedUnderDefaultSettings() = runTest(timeout = 10.seconds) {
         withContext(Dispatchers.Default) {
             val prefix = uniquePrefix()
             val queue = uniqueQueueName()
-            val treatmentTimeout = 1.seconds
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = treatmentTimeout))
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 500.milliseconds))
             q.post(User(1, "A"))
 
             var messageId: kotlin.uuid.Uuid? = null
+            val concurrentlyInFlight = java.util.concurrent.atomic.AtomicInteger(0)
+            var maxConcurrentlyInFlight = 0
             val poolJob = launch {
-                // Default workTimeout == messageTreatmentTimeout, and a non-null workKeepalive
-                // default is computed regardless — it should be active here without being asked for.
                 q.workerPool { message ->
                     messageId = message.id
-                    delay(2.seconds) // longer than messageTreatmentTimeout: keepalive should extend it
+                    val inFlight = concurrentlyInFlight.incrementAndGet()
+                    synchronized(this@WorkerPoolTest) {
+                        maxConcurrentlyInFlight = maxOf(maxConcurrentlyInFlight, inFlight)
+                    }
+                    delay(2.seconds) // overruns processingTimeout
+                    concurrentlyInFlight.decrementAndGet()
                     null
                 }
             }
 
             awaitUntil { messageId != null }
-            val before = dataSource.startedAtOf(prefix, messageId!!)
-            assertNotNull(before)
-            delay(1500.milliseconds) // past messageTreatmentTimeout since the message was picked up
-            val after = dataSource.startedAtOf(prefix, messageId)
-            assertNotNull(after)
-            assertTrue(after.isAfter(before), "keepalive should be active by default and extend started_at")
+            val startedAtWhenPickedUp = dataSource.startedAtOf(prefix, messageId!!)
+            assertNotNull(startedAtWhenPickedUp)
+
+            // Past processingTimeout: the lease is not being extended, because the worker's own
+            // timeout is what handles the overrun.
+            delay(1200.milliseconds)
+            val startedAtLater = dataSource.startedAtOf(prefix, messageId)
+            if (startedAtLater != null) {
+                assertEquals(
+                    startedAtWhenPickedUp,
+                    startedAtLater,
+                    "no keepalive is configured by default, so started_at must not be extended",
+                )
+            }
+
+            // And the overrun never results in the same message being worked twice at once.
+            assertEquals(1, maxConcurrentlyInFlight)
 
             poolJob.cancelAndJoin()
         }
     }
 
-    // [documents the escape hatch from bug 4]
+    // The path where a keepalive genuinely is needed: an explicit timeout longer than the lease.
     @Test
     fun keepaliveIsActiveWhenWorkTimeoutExceedsTreatmentTimeout() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
