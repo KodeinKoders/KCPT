@@ -43,7 +43,34 @@ public interface MessageQueue<T> {
         // worker's own processing timeout always fires first and requeues the message itself.
         // Without it the two deadlines coincide and a reclaim can race an in-flight requeue.
         val processingGrace: Duration = processingTimeout * .2,
-    )
+    ) {
+        // Every one of these fails silently rather than loudly when it is out of range, so they are
+        // rejected at construction. init also covers copy(), so a config derived from a valid one
+        // cannot slip through either.
+        init {
+            // Bound straight into `json_array_length(notes) < ?`, so below 1 nothing is ever
+            // selectable — not even a message that has never been tried. It would then never be
+            // leased, never accrue a note and so never dead-letter: posts would simply accumulate,
+            // invisible, while consumers sat idle.
+            require(maxTries >= 1) { "maxTries must be at least 1, but was $maxTries" }
+            // receive() waits until now + securityCheckTimeout, so at zero the wait loop is skipped
+            // entirely and the retry loop spins on the database as fast as it can.
+            require(securityCheckTimeout > Duration.ZERO) {
+                "securityCheckTimeout must be positive, but was $securityCheckTimeout"
+            }
+            // At zero a message expires the instant it is received: process() starts already past
+            // its deadline, and every lease reads as expired, so messages are reclaimed from under
+            // the workers still holding them.
+            require(processingTimeout > Duration.ZERO) {
+                "processingTimeout must be positive, but was $processingTimeout"
+            }
+            // Negative would let a reclaim happen before the holder's own timeout fires, which
+            // inverts the guarantee the margin exists for.
+            require(processingGrace >= Duration.ZERO) {
+                "processingGrace cannot be negative, but was $processingGrace"
+            }
+        }
+    }
 }
 
 private val leaseExpiredNote: JsonElement = JsonObject(mapOf("cause" to JsonPrimitive("leaseExpired")))

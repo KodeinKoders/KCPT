@@ -67,9 +67,6 @@ class MessageRetryTest : AbstractPgsqlTest() {
         assertNull(q.tryReceive())
     }
 
-    // [FAIL bug 10] Config(maxTries = 0) silently creates a black hole: `0 < 0` is always false,
-    // so tryReceive can never select a message posted to this queue in the first place, and it
-    // is never cleaned up either. This should be rejected at construction time instead.
     @Test
     fun maxTriesOfZeroIsRejected() = runTest(timeout = 5.seconds) {
         assertFailsWith<IllegalArgumentException> {
