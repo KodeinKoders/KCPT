@@ -55,7 +55,6 @@ internal class MessageQueueSinkImpl(
     private val initRef: AtomicReference<Deferred<Unit>?> = AtomicReference(null)
 
     init {
-        require(tables.messages.isNotEmpty()) { "Table name cannot be empty" }
         if (initializationScope != null) {
             // Eager initialisation is owned by the scope the caller handed over, so it stays a
             // child of it: they decide its lifetime, and awaiting that scope awaits this.

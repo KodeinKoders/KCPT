@@ -98,13 +98,41 @@ class MessageQueueSinkTest : AbstractPgsqlTest() {
         assertEquals(listOf("sink", "queue"), order)
     }
 
-    // [FAIL bug 11] MQConnection.kt's MQTables.named uses Utils.escapeLiteral (a string-literal
-    // escaper) on the tablesPrefix, not an identifier allowlist — a prefix containing SQL
-    // metacharacters should be rejected, not silently produce broken/injectable DDL.
+    // The prefix is interpolated into statement text as an identifier, so it is validated rather
+    // than escaped — no escaping function makes an identifier safe after the fact.
     @Test
     fun tablesPrefixWithSqlMetacharactersIsRejected() = runTest(timeout = 5.seconds) {
         assertFailsWith<IllegalArgumentException> {
             MessageQueueSink(source = dataSource.asSource(), tablesPrefix = "public.mq_evil'; DROP TABLE public.mq_messages; --_").initialize()
+        }
+    }
+
+    @Test
+    fun anUnqualifiedTablesPrefixIsAccepted() = runTest(timeout = 5.seconds) {
+        val queue = uniqueQueueName()
+        val mq = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = "mq_${queue}_")
+            .messageQueue(queue, User.serializer())
+        mq.post(User(1, "A"))
+
+        assertNotNull(mq.tryReceive())
+    }
+
+    @Test
+    fun malformedTablesPrefixesAreRejected() = runTest(timeout = 5.seconds) {
+        // Quotes, whitespace, statement separators, comment markers, too many qualifiers, and a
+        // leading digit all fail the identifier shape.
+        listOf(
+            """mq"_""",
+            "mq _",
+            "mq_;drop_",
+            "mq_--_",
+            "a.b.c_",
+            "9mq_",
+            ".mq_",
+        ).forEach { prefix ->
+            assertFailsWith<IllegalArgumentException>("expected '$prefix' to be rejected") {
+                MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+            }
         }
     }
 }
