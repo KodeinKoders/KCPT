@@ -5,6 +5,9 @@ package net.kodein.mq.kcpmq
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.channelFlow
@@ -31,9 +34,33 @@ public class PGChannel<T>(
         }
     }
 
-    public suspend fun openListenConnection(scope: CoroutineScope, source: Source): Flow<T> {
+    public class ConnectionFlow<T> internal constructor(
+        private val job: Job,
+        private val flow: Flow<T>
+    ) : Flow<T> by flow, AutoCloseable {
+        override fun close() {
+            job.cancel()
+        }
+        public suspend fun closeAndJoin() {
+            job.cancelAndJoin()
+        }
+    }
+
+    public suspend fun openListenConnection(scope: CoroutineScope, source: Source): ConnectionFlow<T> {
         val connection = source()
-        scope.coroutineContext[Job]!!.invokeOnCompletion { connection.close() }
+
+        val connectionJob = Job(scope.coroutineContext[Job])
+        val connectionScope = CoroutineScope(scope.coroutineContext + connectionJob)
+
+        connectionScope.launch {
+            try {
+                awaitCancellation()
+            } finally {
+                withContext(Dispatchers.IO + NonCancellable) {
+                    connection.close()
+                }
+            }
+        }
 
         val pgConnection = withContext(Dispatchers.IO) {
             connection.prepareStatement("LISTEN $quotedName").use { it.execute() }
@@ -51,8 +78,10 @@ public class PGChannel<T>(
                 }
             }
         }
-        return flow
-            .shareIn(scope, SharingStarted.WhileSubscribed())
+        return ConnectionFlow(
+            job = connectionJob,
+            flow = flow.shareIn(connectionScope, SharingStarted.WhileSubscribed()),
+        )
     }
 
     public suspend fun notify(connection: Connection, value: T): Unit =
@@ -68,5 +97,5 @@ public class PGChannel<T>(
 public suspend fun <T> Connection.notify(channel: PGChannel<T>, value: T): Unit =
     channel.notify(this, value)
 
-public suspend fun <T> Source.openListenConnection(scope: CoroutineScope, channel: PGChannel<T>): Flow<T> =
+public suspend fun <T> Source.openListenConnection(scope: CoroutineScope, channel: PGChannel<T>): PGChannel.ConnectionFlow<T> =
     channel.openListenConnection(scope, this)

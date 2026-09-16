@@ -6,7 +6,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.builtins.serializer
@@ -126,39 +125,40 @@ internal class MessageQueueImpl<T> internal constructor(
 
     override suspend fun receive(): Message<T> =
         coroutineScope {
-            val flow = source.openListenConnection(this, channel)
-            var message: Message<T>?
-            do {
-                message = tryReceive()
-                if (message == null) {
-                    var next = source().use { connection ->
-                        connection.prepareStatement(
-                            "SELECT min(due_at) FROM ${tables.messages} WHERE queue = ? AND started_at IS NULL AND json_array_length(notes) < ?"
-                        ).use { statement ->
-                            statement.setString(1, name)
-                            statement.setInt(2, config.maxTries)
-                            statement.executeQuery().use { resultSet ->
-                                resultSet.next()
-                                resultSet.getInstantOrNull(1)
+            source.openListenConnection(this, channel).use { flow ->
+                var message: Message<T>?
+                do {
+                    message = tryReceive()
+                    if (message == null) {
+                        var next = source().use { connection ->
+                            connection.prepareStatement(
+                                "SELECT min(due_at) FROM ${tables.messages} WHERE queue = ? AND started_at IS NULL AND json_array_length(notes) < ?"
+                            ).use { statement ->
+                                statement.setString(1, name)
+                                statement.setInt(2, config.maxTries)
+                                statement.executeQuery().use { resultSet ->
+                                    resultSet.next()
+                                    resultSet.getInstantOrNull(1)
+                                }
                             }
+                        } ?: run {
+                            // This timeout is a security measure in case a message was posted to the queue without
+                            // notifying the channel. This should never happen (unless some non-KCMP code writes into the
+                            // message table).
+                            // Note that if a message was posted to the queue exactly between this tryReceive and this flow
+                            // collection, the notification will still be received, as the flow was created before the
+                            // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
+                            // Postgres, and therefore all notifications sent between the flow creation and its collection
+                            // are buffered).
+                            Clock.System.now() + config.securityCheckTimeout
                         }
-                    } ?: run {
-                        // This timeout is a security measure in case a message was posted to the queue without
-                        // notifying the channel. This should never happen (unless some non-KCMP code writes into the
-                        // message table).
-                        // Note that if a message was posted to the queue exactly between this tryReceive and this flow
-                        // collection, the notification will still be received, as the flow was created before the
-                        // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
-                        // Postgres, and therefore all notifications sent between the flow creation and its collection
-                        // are buffered).
-                        Clock.System.now() + config.securityCheckTimeout
+                        while (Clock.System.now() < next) {
+                            val notification = withTimeoutOrNull(next - Clock.System.now()) { flow.first() }
+                            if (notification != null && notification < next) next = notification
+                        }
                     }
-                    while (Clock.System.now() < next) {
-                        val notification = withTimeoutOrNull(next - Clock.System.now()) { flow.first() }
-                        if (notification != null && notification < next) next = notification
-                    }
-                }
-            } while (message == null)
-            message
+                } while (message == null)
+                message
+            }
         }
 }
