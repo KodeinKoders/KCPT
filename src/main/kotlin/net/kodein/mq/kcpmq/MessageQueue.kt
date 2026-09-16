@@ -8,8 +8,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.builtins.serializer
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -47,6 +47,8 @@ public interface MessageQueue<T> {
 }
 
 private val leaseExpiredNote: JsonElement = JsonObject(mapOf("cause" to JsonPrimitive("leaseExpired")))
+
+private val undecodableNote: JsonElement = JsonObject(mapOf("cause" to JsonPrimitive("undecodable")))
 
 internal class MessageQueueImpl<T> internal constructor(
     override val name: String,
@@ -96,6 +98,13 @@ internal class MessageQueueImpl<T> internal constructor(
         }
     }
 
+    private class RawCandidate(
+        val id: Uuid,
+        val payloadJson: String,
+        val notesJson: String,
+        val startedAt: Instant?,
+    )
+
     private class Candidate<T>(
         val id: Uuid,
         val payload: T,
@@ -116,7 +125,7 @@ internal class MessageQueueImpl<T> internal constructor(
             // grace margin to fire and requeue the message itself.
             val reclaimableBefore = now - (config.processingTimeout + config.processingGrace)
 
-            val candidate = prepareStatement(
+            val raw = prepareStatement(
                 """
                     SELECT id, payload, notes, started_at
                     FROM ${tables.messages}
@@ -136,14 +145,23 @@ internal class MessageQueueImpl<T> internal constructor(
                 statement.setInt(4, config.maxTries)
                 statement.executeQuery().use { resultSet ->
                     if (!resultSet.next()) null
-                    else Candidate(
+                    else RawCandidate(
                         id = (resultSet.getObject(1) as UUID).toKotlinUuid(),
-                        payload = Json.decodeFromString(serializer, resultSet.getString(2)),
-                        notes = Json.decodeFromString(JsonArray.serializer(), resultSet.getString(3)),
+                        payloadJson = resultSet.getString(2),
+                        notesJson = resultSet.getString(3),
                         startedAt = resultSet.getInstantOrNull(4),
                     )
                 }
             } ?: return null
+
+            // Decoding happens after the row is selected but before the lease is taken, so a
+            // payload this consumer cannot read is recorded as a failed try and skipped over
+            // rather than thrown out of the transaction — otherwise it would roll back untouched,
+            // stay first in line, and wedge the queue behind it forever.
+            val candidate = decode(raw) ?: run {
+                recordUndecodable(raw, now)
+                continue
+            }
 
             if (candidate.startedAt == null) {
                 prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
@@ -174,6 +192,47 @@ internal class MessageQueueImpl<T> internal constructor(
             }
             return message(candidate.id, candidate.payload, notes, now)
         }
+    }
+
+    private fun decode(raw: RawCandidate): Candidate<T>? =
+        try {
+            Candidate(
+                id = raw.id,
+                payload = mqJson.decodeFromString(serializer, raw.payloadJson),
+                notes = mqJson.decodeFromString(JsonArray.serializer(), raw.notesJson),
+                startedAt = raw.startedAt,
+            )
+        } catch (_: SerializationException) {
+            null
+        }
+
+    // An undecodable payload is counted as a failed try like any other failure, rather than
+    // dropped outright: the usual cause is a consumer that is behind the producer, and rolling it
+    // forward makes the message readable again. due_at is pushed out so the retries are spread
+    // over time instead of being burnt through in a tight loop.
+    private fun Connection.recordUndecodable(raw: RawCandidate, now: Instant) {
+        val previousNotes =
+            try { mqJson.decodeFromString(JsonArray.serializer(), raw.notesJson) }
+            catch (_: SerializationException) { JsonArray(emptyList()) }
+        val notes = JsonArray(previousNotes + undecodableNote)
+
+        if (notes.size >= config.maxTries) {
+            prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
+                statement.setObject(1, raw.id.toJavaUuid())
+                statement.executeUpdate()
+            }
+            commit()
+            messageObservers.forEach { it.onUndecodable(raw.id, raw.payloadJson, undecodableNote) }
+            return
+        }
+
+        prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
+            statement.setInstant(1, now + config.processingTimeout)
+            statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
+            statement.setObject(3, raw.id.toJavaUuid())
+            statement.executeUpdate()
+        }
+        commit()
     }
 
     private fun message(id: Uuid, payload: T, notes: List<JsonElement>, now: Instant): Message<T> =

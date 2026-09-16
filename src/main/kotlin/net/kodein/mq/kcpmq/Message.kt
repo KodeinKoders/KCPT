@@ -40,6 +40,10 @@ public interface Message<T> {
     public interface Observer<in T> {
         public fun onSuccess(id: Uuid, payload: T, notes: JsonElement)
         public fun onFailure(id: Uuid, payload: T, notes: JsonElement)
+
+        // Dropped after its payload could not be decoded, so there is no T to report — the raw
+        // JSON is given instead, since it is the only remaining record of the message.
+        public fun onUndecodable(id: Uuid, payloadJson: String, notes: JsonElement) {}
     }
 }
 
