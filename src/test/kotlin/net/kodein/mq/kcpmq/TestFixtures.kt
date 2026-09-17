@@ -34,6 +34,31 @@ class RecordingObserver<T> : Message.Observer<T> {
     }
 }
 
+// A badly-behaved observer: throws from whichever callbacks it is told to, and records every call
+// it was given so a test can tell "never invoked" from "invoked and threw".
+class ThrowingObserver<T>(
+    private val onSuccess: Boolean = false,
+    private val onFailure: Boolean = false,
+    private val onUndecodable: Boolean = false,
+) : Message.Observer<T> {
+    val calls = CopyOnWriteArrayList<String>()
+
+    override fun onSuccess(id: Uuid, payload: T, notes: JsonElement) {
+        calls += "success"
+        if (onSuccess) throw RuntimeException("observer boom: onSuccess")
+    }
+
+    override fun onFailure(id: Uuid, payload: T, notes: JsonElement) {
+        calls += "failure"
+        if (onFailure) throw RuntimeException("observer boom: onFailure")
+    }
+
+    override fun onUndecodable(id: Uuid, payloadJson: String, notes: JsonElement) {
+        calls += "undecodable"
+        if (onUndecodable) throw RuntimeException("observer boom: onUndecodable")
+    }
+}
+
 // Records what a sink reports about notifications it could not decode.
 class RecordingUndecodableNotifications {
     data class Recorded(val channel: String, val payload: String, val cause: Throwable)

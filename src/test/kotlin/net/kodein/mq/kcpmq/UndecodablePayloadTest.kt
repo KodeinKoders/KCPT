@@ -113,6 +113,47 @@ class UndecodablePayloadTest : AbstractPgsqlTest() {
         }
     }
 
+    // The undecodable dead-letter runs inside receiveNextOrNull's scan too, so a throwing observer
+    // there reached receive() and killed the pool — the same blast radius as an undecodable payload
+    // itself once had, reopened from the observer side.
+    @Test
+    fun aThrowingObserverDoesNotKillAWorkerPool() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val throwing = ThrowingObserver<User>(onUndecodable = true)
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(
+                    queue,
+                    User.serializer(),
+                    MessageQueue.Config(maxTries = 1, processingTimeout = 300.milliseconds),
+                    listOf(throwing),
+                )
+            dataSource.rawInsertMessage(prefix, queue, Uuid.random(), Clock.System.now() - 1.seconds, garbage)
+
+            val processed = CopyOnWriteArrayList<User>()
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1) { message -> processed += message.payload; null }
+            }
+            q.post(User(1, "readable"))
+
+            awaitUntil(
+                timeout = 10.seconds,
+                message = "the pool stopped after an observer threw while dead-lettering",
+            ) { processed.isNotEmpty() }
+            assertTrue(poolJob.isActive, "the pool must survive an observer that throws")
+            assertEquals(listOf(User(1, "readable")), processed.toList())
+            // It also sees the readable message succeed, since it is registered on the queue.
+            assertEquals(
+                "undecodable",
+                throwing.calls.firstOrNull(),
+                "the observer must still have been told about the payload it could not decode",
+            )
+
+            poolJob.cancel()
+        }
+    }
+
     // Rolling the message forward makes it available again at a new due_at, so it announces itself
     // like every other write that does. The consumer that performed the roll-forward loops on
     // immediately and needs no telling; one parked on a later deadline does. Asserted on the

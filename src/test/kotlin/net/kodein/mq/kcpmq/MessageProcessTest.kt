@@ -78,6 +78,39 @@ class MessageProcessTest : AbstractPgsqlTest() {
         }
     }
 
+    // An observer runs on the acknowledgement path, after the row is already gone, and
+    // successDelete is called from inside process()'s try — so an observer that throws used to be
+    // indistinguishable from a processing failure. process() would then requeue a message it had
+    // just deleted, and at maxTries = 1 that requeue dead-letters: the same message reported as
+    // both a success and a failure, to an observer that never even saw the success.
+    @Test
+    fun aThrowingObserverDoesNotTurnASuccessIntoAFailure() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val throwing = ThrowingObserver<User>(onSuccess = true)
+            val watching = RecordingObserver<User>()
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val mq = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(
+                    queue,
+                    User.serializer(),
+                    MessageQueue.Config(maxTries = 1),
+                    listOf(throwing, watching),
+                )
+            mq.post(User(1, "A"))
+
+            mq.tryReceive()!!.process { null }
+
+            assertEquals(listOf("success"), throwing.calls, "the throwing observer must see only the success")
+            assertEquals(1, watching.successes.size, "an observer behind a throwing one must still be told")
+            assertTrue(
+                watching.failures.isEmpty(),
+                "a message that succeeded must not also be reported as a failure",
+            )
+            assertEquals(0, dataSource.countMessages(prefix, queue), "the message succeeded and is gone")
+        }
+    }
+
     @Test
     fun processRequeuesWhenTheLambdaThrows() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {

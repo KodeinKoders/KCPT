@@ -227,7 +227,7 @@ internal class MessageQueueImpl<T> internal constructor(
                         statement.executeUpdate()
                     }
                     commit()
-                    messageObservers.forEach { it.onFailure(candidate.id, candidate.payload, leaseExpiredNote) }
+                    messageObservers.notifyEach { it.onFailure(candidate.id, candidate.payload, leaseExpiredNote) }
                     continue
                 }
                 prepareStatement("UPDATE ${tables.messages} SET started_at = ?, notes = ?::json WHERE id = ?").use { statement ->
@@ -269,7 +269,7 @@ internal class MessageQueueImpl<T> internal constructor(
                 statement.executeUpdate()
             }
             commit()
-            messageObservers.forEach { it.onUndecodable(raw.id, raw.payloadJson, undecodableNote) }
+            messageObservers.notifyEach { it.onUndecodable(raw.id, raw.payloadJson, undecodableNote) }
             return
         }
 

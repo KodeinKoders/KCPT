@@ -157,6 +157,44 @@ class MessageLeaseTest : AbstractPgsqlTest() {
         }
     }
 
+    // The dead-letter notification for an exhausted lease happens inside receiveNextOrNull's scan,
+    // after its commit. A throwing observer there used to be rethrown by the transaction wrapper,
+    // abandoning the scan mid-loop: the deletes were already durable, but the deliverable message
+    // behind them was never returned, and tryReceive failed outright.
+    @Test
+    fun aThrowingObserverDoesNotAbandonTheDeadLetterScan() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val throwing = ThrowingObserver<User>(onFailure = true)
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(
+                    queue,
+                    User.serializer(),
+                    MessageQueue.Config(maxTries = 1, processingTimeout = 300.milliseconds),
+                    listOf(throwing),
+                )
+            q.post(User(1, "abandoned-a"))
+            q.post(User(2, "abandoned-b"))
+            q.post(User(3, "deliverable"))
+
+            // Take and abandon the first two; the third stays fresh.
+            assertEquals(User(1, "abandoned-a"), q.tryReceive()?.payload)
+            assertEquals(User(2, "abandoned-b"), q.tryReceive()?.payload)
+
+            delay(1.seconds)
+
+            val delivered = q.tryReceive()
+            assertNotNull(delivered, "a throwing observer must not abandon the scan behind it")
+            assertEquals(User(3, "deliverable"), delivered.payload)
+            assertEquals(
+                listOf("failure", "failure"),
+                throwing.calls,
+                "both exhausted leases must still be reported, despite the first one throwing",
+            )
+        }
+    }
+
     // A consumer that is already parked inside receive() must wake when an abandoned lease becomes
     // reclaimable. Its wake-up deadline used to be derived from unleased messages only, so a live
     // lease was invisible to it: the message became reclaimable a grace margin after its holder's

@@ -47,6 +47,24 @@ public interface Message<T> {
     }
 }
 
+// Observers are caller-supplied code sitting on the acknowledgement path, after the row has already
+// been written. One that throws must not hide the observers behind it, and must not reach the
+// caller: successDelete is called from inside process()'s try, where an observer's exception is
+// indistinguishable from a processing failure, and process() would go on to requeue a message it
+// has just deleted — reporting the same message as both a success and a failure.
+//
+// Throwable, with no re-raise of CancellationException: these callbacks are not suspend, so they
+// cannot legitimately take part in cancellation, and letting one through would reopen this very
+// hole by another route.
+internal inline fun <T> List<Message.Observer<T>>.notifyEach(block: (Message.Observer<T>) -> Unit) {
+    forEach {
+        try {
+            block(it)
+        } catch (_: Throwable) {
+        }
+    }
+}
+
 internal class MessageImpl<T>(
     override val id: Uuid,
     override val payload: T,
@@ -75,7 +93,7 @@ internal class MessageImpl<T>(
                 statement.executeUpdate()
             }
         }
-        observers.forEach { it.onSuccess(id, payload, notes) }
+        observers.notifyEach { it.onSuccess(id, payload, notes) }
     }
 
     override suspend fun failureRequeue(due: Instant?, notes: JsonElement): Unit = withContext(Dispatchers.IO) {
@@ -110,7 +128,7 @@ internal class MessageImpl<T>(
                 statement.executeUpdate()
             }
         }
-        observers.forEach { it.onFailure(id, payload, notes) }
+        observers.notifyEach { it.onFailure(id, payload, notes) }
     }
 
     override suspend fun extend(): Unit = withContext(Dispatchers.IO) {
