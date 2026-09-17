@@ -248,6 +248,44 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
         }
     }
 
+    // NOTIFY is open to any role that can reach the database and the queue's channel name is
+    // derived from the table prefix and queue name, so a foreign session — or a producer on a wire
+    // format this consumer does not know — can put anything on it. A payload that cannot be read
+    // used to fail the listening flow and surface out of receive(), which in a worker pool took
+    // every in-flight worker down with it.
+    @Test
+    fun receiveSurvivesAMalformedNotificationOnItsChannel() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val observer = RecordingObserver<User>()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(
+                    queue,
+                    User.serializer(),
+                    MessageQueue.Config(securityCheckTimeout = 30.seconds),
+                    listOf(observer),
+                )
+
+            val waiter = async { q.receive() }
+            delay(400.milliseconds) // parked, and listening
+
+            dataSource.rawNotify("${prefix}messages_$queue", "not-json-at-all")
+            delay(200.milliseconds)
+            q.post(User(1, "A"))
+
+            val message = withTimeoutOrNull(8.seconds) { waiter.await() }
+            assertNotNull(message, "a notification it could not read must not take receive() down")
+            assertEquals(User(1, "A"), message.payload)
+            assertEquals(
+                1,
+                observer.undecodableNotifications.size,
+                "the queue's observers must be told which producer is speaking the wrong format",
+            )
+            assertEquals("not-json-at-all", observer.undecodableNotifications.single().payload)
+        }
+    }
+
     @Test
     fun concurrentReceiversEachGetADistinctMessage() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {

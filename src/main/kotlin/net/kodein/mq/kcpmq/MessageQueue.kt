@@ -108,6 +108,16 @@ internal class MessageQueueImpl<T> internal constructor(
     private val channel = PGChannel(
         name = "${tables.messages}_$name",
         serializer = Instant.serializer(),
+        onUndecodableNotification = { channelName, payload, cause ->
+            // Each observer separately, so one that throws neither hides the others nor reaches
+            // the listening loop.
+            messageObservers.forEach {
+                try {
+                    it.onUndecodableNotification(channelName, payload, cause)
+                } catch (_: Throwable) {
+                }
+            }
+        },
     )
 
     @OptIn(ExperimentalUuidApi::class)

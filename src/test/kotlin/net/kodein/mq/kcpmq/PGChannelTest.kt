@@ -13,10 +13,13 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -114,6 +117,76 @@ class PGChannelTest : AbstractPgsqlTest() {
                 }
 
                 assertEquals(Foo("bar"), withTimeoutOrNull(2.seconds) { received.await() })
+                collector.cancel()
+                cancel()
+            }.join()
+        }
+    }
+
+    // A notification is only ever a hint that work may be available, so one whose payload cannot be
+    // read must not be propagated: letting it out failed this flow and with it every consumer
+    // collecting it. NOTIFY is open to any role that can reach the database and the channel name is
+    // easy to guess, so this was reachable without any privilege — and a producer on an older or
+    // newer wire format would have tripped it by accident.
+    @Test
+    fun anUndecodableNotificationIsDroppedAndReported() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val reports = CopyOnWriteArrayList<Triple<String, String, Throwable>>()
+            val name = "bad_${uniqueQueueName()}"
+            val channel = PGChannel(name, Foo.serializer()) { reportedChannel, payload, cause ->
+                reports += Triple(reportedChannel, payload, cause)
+            }
+
+            launch {
+                val flow = dataSource.asSource().openListenConnection(this, channel)
+                val received = kotlinx.coroutines.CompletableDeferred<Foo>()
+                val collector = launch { received.complete(flow.first()) }
+                delay(300.milliseconds) // let the collector subscribe before anything is sent
+
+                dataSource.rawNotify(name, "not-json-at-all")
+                dataSource.connection.use { connection -> connection.notify(channel, Foo("good")) }
+
+                assertEquals(
+                    Foo("good"),
+                    withTimeoutOrNull(5.seconds) { received.await() },
+                    "the flow must survive the undecodable notification and deliver the next one",
+                )
+                collector.cancel()
+                cancel()
+            }.join()
+
+            assertEquals(1, reports.size, "the undecodable notification must be reported, not silently dropped")
+            val (reportedChannel, payload, cause) = reports.single()
+            assertEquals(name, reportedChannel)
+            assertEquals("not-json-at-all", payload)
+            assertTrue(cause is SerializationException, "expected the decode failure as the cause, got $cause")
+        }
+    }
+
+    // The handler is caller-supplied code on the listening path, so it must not be able to fail the
+    // flow either — that would re-create, by a second route, exactly the breakage it reports.
+    @Test
+    fun aThrowingUndecodableHandlerDoesNotBreakTheFlow() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val name = "boom_${uniqueQueueName()}"
+            val channel = PGChannel(name, Foo.serializer()) { _, _, _ ->
+                throw RuntimeException("handler boom")
+            }
+
+            launch {
+                val flow = dataSource.asSource().openListenConnection(this, channel)
+                val received = kotlinx.coroutines.CompletableDeferred<Foo>()
+                val collector = launch { received.complete(flow.first()) }
+                delay(300.milliseconds)
+
+                dataSource.rawNotify(name, "not-json-at-all")
+                dataSource.connection.use { connection -> connection.notify(channel, Foo("good")) }
+
+                assertEquals(
+                    Foo("good"),
+                    withTimeoutOrNull(5.seconds) { received.await() },
+                    "a throwing handler must not take the flow down with it",
+                )
                 collector.cancel()
                 cancel()
             }.join()

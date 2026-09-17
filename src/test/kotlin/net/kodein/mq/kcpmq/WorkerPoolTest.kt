@@ -65,6 +65,37 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
+    // The blast radius of a notification that cannot be decoded: workerPool calls receive() inside
+    // its coroutineScope, so an exception escaping receive() cancels every in-flight worker. One
+    // NOTIFY from any session that can reach the database used to be enough.
+    @Test
+    fun workerPoolSurvivesAMalformedNotificationOnItsChannel() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer())
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1) { message -> processed += message.payload.id; null }
+            }
+            delay(600.milliseconds) // the pool is parked in receive(), listening
+
+            dataSource.rawNotify("${prefix}messages_$queue", "not-json-at-all")
+            delay(200.milliseconds)
+            q.post(User(1, "A"))
+
+            awaitUntil(
+                timeout = 10.seconds,
+                message = "the pool stopped processing after a notification it could not decode",
+            ) { processed.contains(1) }
+            assertTrue(poolJob.isActive, "the pool must survive a notification it cannot decode")
+
+            poolJob.cancelAndJoin()
+        }
+    }
+
     @Test
     fun workerPoolRejectsKeepaliveNotLessThanTreatmentTimeout() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {

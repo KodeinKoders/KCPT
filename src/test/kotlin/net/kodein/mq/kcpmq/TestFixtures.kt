@@ -22,8 +22,11 @@ data class UserV2(val id: Int, val name: String, val extra: String = "x")
 class RecordingObserver<T> : Message.Observer<T> {
     data class Recorded<T>(val id: Uuid, val payload: T, val notes: JsonElement)
 
+    data class RecordedNotification(val channel: String, val payload: String, val cause: Throwable)
+
     val successes = CopyOnWriteArrayList<Recorded<T>>()
     val failures = CopyOnWriteArrayList<Recorded<T>>()
+    val undecodableNotifications = CopyOnWriteArrayList<RecordedNotification>()
 
     override fun onSuccess(id: Uuid, payload: T, notes: JsonElement) {
         successes += Recorded(id, payload, notes)
@@ -32,7 +35,23 @@ class RecordingObserver<T> : Message.Observer<T> {
     override fun onFailure(id: Uuid, payload: T, notes: JsonElement) {
         failures += Recorded(id, payload, notes)
     }
+
+    override fun onUndecodableNotification(channel: String, payload: String, cause: Throwable) {
+        undecodableNotifications += RecordedNotification(channel, payload, cause)
+    }
 }
+
+// Speaks to a channel the way any other database session could. NOTIFY is open to any role that can
+// connect and the channel name is derivable from the table prefix and queue name, so this is what a
+// foreign producer — or one on a wire format this consumer does not know — looks like from here.
+fun HikariDataSource.rawNotify(channel: String, payload: String) =
+    connection.use { connection ->
+        connection.prepareStatement("SELECT pg_notify(?, ?)").use { statement ->
+            statement.setString(1, channel)
+            statement.setString(2, payload)
+            statement.execute()
+        }
+    }
 
 fun HikariDataSource.countMessages(prefix: String, queue: String): Int =
     connection.use { connection ->

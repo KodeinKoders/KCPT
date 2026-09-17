@@ -44,6 +44,13 @@ public interface Message<T> {
         // Dropped after its payload could not be decoded, so there is no T to report — the raw
         // JSON is given instead, since it is the only remaining record of the message.
         public fun onUndecodable(id: Uuid, payloadJson: String, notes: JsonElement) {}
+
+        // Not a message at all: a wake-up notification on the queue's channel whose payload could
+        // not be read, so there is no id and no T. It is dropped rather than thrown, because a
+        // notification is only ever a hint that work may be available — but it is reported rather
+        // than swallowed, because the usual cause is a producer writing a format this consumer
+        // cannot read, and nothing else in the process would ever say so.
+        public fun onUndecodableNotification(channel: String, payload: String, cause: Throwable) {}
     }
 }
 

@@ -18,6 +18,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.SerializationException
 import org.postgresql.PGConnection
 import org.postgresql.core.Utils
 import java.sql.Connection
@@ -34,6 +35,11 @@ private const val NOTIFICATION_POLL_MS: Int = 50
 public class PGChannel<T>(
     public val name: String,
     private val serializer: KSerializer<T>,
+    // Told about a notification arriving on this channel whose payload cannot be decoded. Such a
+    // notification is dropped, so without this hook nothing in the process would report that a
+    // producer is speaking a format this listener cannot read.
+    private val onUndecodableNotification:
+        (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
 ) {
     private val quotedName: String = Utils.escapeIdentifier(null, name).toString()
 
@@ -53,6 +59,15 @@ public class PGChannel<T>(
         }
         public suspend fun closeAndJoin() {
             job.cancelAndJoin()
+        }
+    }
+
+    // The handler is caller-supplied code on the listening path, so it is not allowed to fail the
+    // flow either — that would re-create, by a second route, exactly the breakage it reports.
+    private fun report(payload: String, cause: Throwable) {
+        try {
+            onUndecodableNotification(name, payload, cause)
+        } catch (_: Throwable) {
         }
     }
 
@@ -94,7 +109,18 @@ public class PGChannel<T>(
                             .forEach { notification ->
                                 // Ignore stale notifications.
                                 if (notification.name == name) {
-                                    val element = mqJson.decodeFromString(serializer, notification.parameter)
+                                    // A notification is only ever a hint that work may be
+                                    // available, so one whose payload cannot be read is dropped
+                                    // rather than propagated. Letting it out would fail this flow,
+                                    // and with it every consumer collecting it — and NOTIFY is
+                                    // open to any role that can reach the database.
+                                    val element =
+                                        try {
+                                            mqJson.decodeFromString(serializer, notification.parameter)
+                                        } catch (cause: SerializationException) {
+                                            report(notification.parameter, cause)
+                                            return@forEach
+                                        }
                                     channel.send(element)
                                 }
                             }
