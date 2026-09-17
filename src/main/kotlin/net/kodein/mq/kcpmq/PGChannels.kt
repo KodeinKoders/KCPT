@@ -12,8 +12,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.shareIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import org.postgresql.PGConnection
@@ -60,29 +62,43 @@ public class PGChannel<T>(
         val connectionJob = Job(scope.coroutineContext[Job])
         val connectionScope = CoroutineScope(scope.coroutineContext + connectionJob)
 
+        val connectionMutex = Mutex()
+
         connectionScope.launch {
             try {
                 awaitCancellation()
             } finally {
                 withContext(Dispatchers.IO + NonCancellable) {
-                    connection.close()
+                    connectionMutex.withLock {
+                        try {
+                            connection.prepareStatement("UNLISTEN $quotedName").use { it.execute() }
+                        } finally {
+                            connection.close()
+                        }
+                    }
                 }
             }
         }
 
-        val pgConnection = withContext(Dispatchers.IO) {
+        withContext(Dispatchers.IO) {
             connection.prepareStatement("LISTEN $quotedName").use { it.execute() }
-            connection.unwrap(PGConnection::class.java)
         }
+
         val flow = channelFlow {
-            runInterruptible(Dispatchers.IO) {
-                while (!Thread.currentThread().isInterrupted) {
-                    val notifications = pgConnection.getNotifications(NOTIFICATION_POLL_MS)?.toList() ?: emptyList()
-                    notifications
-                        .forEach { notification ->
-                            val element = mqJson.decodeFromString(serializer, notification.parameter)
-                            launch { channel.send(element) }
-                        }
+            withContext(Dispatchers.IO) {
+                val pgConnection = connection.unwrap(PGConnection::class.java)
+                connectionMutex.withLock {
+                    while (isActive) {
+                        val notifications = pgConnection.getNotifications(NOTIFICATION_POLL_MS)?.toList() ?: emptyList()
+                        notifications
+                            .forEach { notification ->
+                                // Ignore stale notifications.
+                                if (notification.name == name) {
+                                    val element = mqJson.decodeFromString(serializer, notification.parameter)
+                                    channel.send(element)
+                                }
+                            }
+                    }
                 }
             }
         }

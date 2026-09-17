@@ -1,5 +1,6 @@
 package net.kodein.mq.kcpmq
 
+import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
@@ -170,6 +171,45 @@ class PGChannelTest : AbstractPgsqlTest() {
             }
             delay(200.milliseconds)
             assertEquals(0, dataSource.hikariPoolMXBean.activeConnections)
+        }
+    }
+
+    // Releasing the connection is not enough: it goes back to a pool, so it has to go back clean.
+    // A LISTEN left registered keeps delivering into whoever borrows the connection next, which is
+    // not hypothetical — a stale registration once fed a previous incarnation's notification to a
+    // later listener, which took the notification for one of its own.
+    @Test
+    fun aReleasedConnectionIsNoLongerListening() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            // A pool of exactly one, so the connection borrowed below is necessarily the one that
+            // was just listening.
+            HikariDataSource().apply {
+                jdbcUrl = pgContainer.jdbcUrl
+                username = pgContainer.username
+                password = pgContainer.password
+                maximumPoolSize = 1
+            }.use { single ->
+                val channel = PGChannel("unlisten_${uniqueQueueName()}", Foo.serializer())
+                coroutineScope {
+                    single.asSource().openListenConnection(this, channel).closeAndJoin()
+                }
+
+                single.connection.use { connection ->
+                    connection.prepareStatement(
+                        "SELECT count(*) FROM pg_listening_channels() AS c WHERE c = ?"
+                    ).use { statement ->
+                        statement.setString(1, channel.name)
+                        statement.executeQuery().use { resultSet ->
+                            resultSet.next()
+                            assertEquals(
+                                0,
+                                resultSet.getInt(1),
+                                "the connection went back to the pool still listening on ${channel.name}",
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
