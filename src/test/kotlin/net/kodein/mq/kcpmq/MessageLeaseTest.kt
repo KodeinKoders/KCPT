@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Test
@@ -152,6 +153,42 @@ class MessageLeaseTest : AbstractPgsqlTest() {
             assertEquals(User(3, "deliverable"), delivered.payload)
             assertEquals(2, observer.failures.size, "both exhausted leases must be dead-lettered")
             assertEquals(1, dataSource.countMessages(prefix, queue), "only the delivered message must remain")
+        }
+    }
+
+    // A consumer that is already parked inside receive() must wake when an abandoned lease becomes
+    // reclaimable. Its wake-up deadline used to be derived from unleased messages only, so a live
+    // lease was invisible to it: the message became reclaimable a grace margin after its holder's
+    // timeout, but nobody looked again until the securityCheckTimeout — ten minutes by default —
+    // which reduced the whole lease mechanism to that timer. The distinction matters because this
+    // is the ordinary shape of a worker pool: workers sit in receive() while other workers work.
+    @Test
+    fun aParkedReceiveWakesWhenAnAbandonedLeaseBecomesReclaimable() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
+                .messageQueue(
+                    uniqueQueueName(),
+                    User.serializer(),
+                    // A securityCheckTimeout far beyond the test's patience: if the deadline falls
+                    // back to it, the receive() below returns nothing and the test fails.
+                    MessageQueue.Config(processingTimeout = 500.milliseconds, securityCheckTimeout = 60.seconds),
+                )
+            q.post(User(1, "A"))
+            val abandoned = q.tryReceive()
+            assertNotNull(abandoned) // leased, and deliberately never acknowledged
+
+            val reclaimed = withTimeoutOrNull(5.seconds) { q.receive() }
+
+            assertNotNull(
+                reclaimed,
+                "a parked receive() must wake on the lease deadline, not sit on the securityCheckTimeout",
+            )
+            assertEquals(abandoned.id, reclaimed.id)
+            assertEquals(
+                JsonPrimitive("leaseExpired"),
+                (reclaimed.notes.single() as JsonObject)["cause"],
+                "the abandoned attempt must be recorded as a try",
+            )
         }
     }
 

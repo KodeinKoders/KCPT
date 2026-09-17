@@ -304,7 +304,8 @@ internal class MessageQueueImpl<T> internal constructor(
                 source().use { connection ->
                     val message = connection.receiveNextOrNull(now)
                     if (message != null) return message
-
+                    val lease = config.processingTimeout + config.processingGrace
+                    val leaseExpiresWhenStartedAt = now - lease
                     // Here we take the next due message in the strict future (not including now).
                     // If there are messages due now or in the past, we know that they are being processed since
                     // receiveNextOrNull returned null (so they were skipped).
@@ -313,15 +314,31 @@ internal class MessageQueueImpl<T> internal constructor(
                     // immediately restart because of the notification in the channel.
                     next = connection.prepareStatement(
                         """
-                            SELECT min(due_at)
-                            FROM ${tables.messages}
-                            WHERE   queue = ?
-                                AND started_at IS NULL
-                                AND due_at > ?
+                            SELECT LEAST(
+                                (
+                                    SELECT min(due_at)
+                                    FROM ${tables.messages}
+                                    WHERE
+                                            queue = ?
+                                        AND started_at IS NULL
+                                        AND due_at > ?
+                                ),
+                                (
+                                    SELECT min(started_at)
+                                    FROM ${tables.messages}
+                                    WHERE
+                                            queue = ?
+                                        AND started_at IS NOT NULL
+                                        AND started_at > ?
+                                ) + ?::interval
+                            )
                             """.trimIndent()
                     ).use { statement ->
                         statement.setString(1, name)
                         statement.setInstant(2, now)
+                        statement.setString(3, name)
+                        statement.setInstant(4, leaseExpiresWhenStartedAt)
+                        statement.setString(5, "${lease.inWholeMilliseconds} ms")
                         statement.executeQuery().use { resultSet ->
                             resultSet.next()
                             resultSet.getInstantOrNull(1)

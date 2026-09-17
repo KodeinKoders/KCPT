@@ -7,6 +7,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.test.assertEquals
@@ -132,55 +136,62 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
-    // Under default settings no keepalive is needed, and none is configured: timeout equals
-    // processingTimeout, so the worker's own withTimeout fires and requeues the message a whole
-    // processingGrace before a reclaim could take it. Work that overruns is therefore handed back
-    // rather than extended, and never processed twice.
+    // Under default settings no keepalive is needed, and none is configured: workerPool's timeout
+    // equals the queue's processingTimeout, so the holder's own withTimeout fires and hands the
+    // message back a whole processingGrace before anyone could reclaim it. The message is therefore
+    // requeued by its own worker — and then redelivered, promptly, since a parked receive() wakes on
+    // the lease deadline — but it is never extended, and never worked by two workers at once.
+    //
+    // started_at cannot tell those apart: it advances on an extension AND on a redelivery. The
+    // notes can — extend() never writes them, so a note is proof the message was handed back rather
+    // than held on to.
     @Test
-    fun workThatOverrunsIsRequeuedRatherThanExtendedUnderDefaultSettings() = runTest(timeout = 10.seconds) {
+    fun workThatOverrunsIsRequeuedRatherThanExtendedUnderDefaultSettings() = runTest(timeout = 20.seconds) {
         withContext(Dispatchers.Default) {
             val prefix = uniquePrefix()
             val queue = uniqueQueueName()
             val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 500.milliseconds))
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
             q.post(User(1, "A"))
 
             var messageId: kotlin.uuid.Uuid? = null
-            val concurrentlyInFlight = java.util.concurrent.atomic.AtomicInteger(0)
-            var maxConcurrentlyInFlight = 0
+            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
+            val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+            val maxInFlight = java.util.concurrent.atomic.AtomicInteger(0)
+
             val poolJob = launch {
                 q.workerPool { message ->
                     messageId = message.id
-                    val inFlight = concurrentlyInFlight.incrementAndGet()
-                    synchronized(this@WorkerPoolTest) {
-                        maxConcurrentlyInFlight = maxOf(maxConcurrentlyInFlight, inFlight)
+                    attempts.incrementAndGet()
+                    val current = inFlight.incrementAndGet()
+                    maxInFlight.updateAndGet { maxOf(it, current) }
+                    try {
+                        delay(5.seconds) // overruns processingTimeout, so this attempt is timed out
+                        null
+                    } finally {
+                        // In a finally, so a timed-out attempt is counted out again. Below the
+                        // delay it would never run, and the counter would tally attempts rather
+                        // than concurrency.
+                        inFlight.decrementAndGet()
                     }
-                    delay(2.seconds) // overruns processingTimeout
-                    concurrentlyInFlight.decrementAndGet()
-                    null
                 }
             }
 
-            awaitUntil { messageId != null }
-            val startedAtWhenPickedUp = dataSource.startedAtOf(prefix, messageId!!)
-            assertNotNull(startedAtWhenPickedUp)
-
-            // Past processingTimeout: the lease is not being extended, because the worker's own
-            // timeout is what handles the overrun.
-            delay(1200.milliseconds)
-            val startedAtLater = dataSource.startedAtOf(prefix, messageId)
-            if (startedAtLater != null) {
-                assertEquals(
-                    startedAtWhenPickedUp,
-                    startedAtLater,
-                    "no keepalive is configured by default, so started_at must not be extended",
-                )
-            }
-
-            // And the overrun never results in the same message being worked twice at once.
-            assertEquals(1, maxConcurrentlyInFlight)
-
+            // The first attempt overran and was handed back; a second one means it was redelivered
+            // rather than stranded.
+            awaitUntil(timeout = 10.seconds) { attempts.get() >= 2 }
             poolJob.cancelAndJoin()
+
+            assertEquals(1, maxInFlight.get(), "the message was worked by two workers at once")
+
+            val notes = Json.parseToJsonElement(dataSource.readNotesJson(prefix, messageId!!)) as JsonArray
+            assertTrue(notes.isNotEmpty(), "the overrun must be recorded as a failed try")
+            assertEquals(
+                JsonPrimitive("timeout"),
+                (notes.first() as JsonObject)["cause"],
+                "the holder's own timeout must be what handed the message back — a reclaim would " +
+                    "read leaseExpired, and an extension would have written no note at all",
+            )
         }
     }
 
