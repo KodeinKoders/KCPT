@@ -55,6 +55,9 @@ internal class MessageImpl<T>(
     override val notes: List<JsonElement>,
     private val source: Source,
     private val tables: MQTables,
+    // Requeuing makes this message available again, which a consumer already parked in receive()
+    // has no other way of learning — so it is announced on the same channel post() uses.
+    private val channel: PGChannel<Instant>,
     private val observers: List<Message.Observer<T>> = emptyList(),
 ) : Message<T> {
 
@@ -82,12 +85,20 @@ internal class MessageImpl<T>(
             return@withContext
         }
 
+        val dueAt = due ?: Clock.System.now()
         source().use { connection ->
-            connection.prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
-                statement.setInstant(1, due ?: Clock.System.now())
-                statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), updatedNotes))
-                statement.setObject(3, id.toJavaUuid())
-                statement.executeUpdate()
+            // The update and the notification share a transaction, exactly as in post(). Postgres
+            // only delivers NOTIFY on commit, and that ordering is the point: a notification that
+            // arrived before its row was visible would wake a consumer, show it nothing, and send
+            // it back to sleep on a later deadline — worse than never notifying at all.
+            connection.transaction {
+                prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
+                    statement.setInstant(1, dueAt)
+                    statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), updatedNotes))
+                    statement.setObject(3, id.toJavaUuid())
+                    statement.executeUpdate()
+                }
+                notify(channel, dueAt)
             }
         }
     }

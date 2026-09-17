@@ -166,7 +166,7 @@ internal class MessageQueueImpl<T> internal constructor(
         }
     }
 
-    private fun Connection.receiveNextOrNull(now: Instant): Message<T>? {
+    private suspend fun Connection.receiveNextOrNull(now: Instant): Message<T>? {
         transaction {
             while (true) {
                 // A lease is only reclaimable once the holder's own processing timeout has had the
@@ -257,7 +257,7 @@ internal class MessageQueueImpl<T> internal constructor(
     // dropped outright: the usual cause is a consumer that is behind the producer, and rolling it
     // forward makes the message readable again. due_at is pushed out so the retries are spread
     // over time instead of being burnt through in a tight loop.
-    private fun Connection.recordUndecodable(raw: RawCandidate, now: Instant) {
+    private suspend fun Connection.recordUndecodable(raw: RawCandidate, now: Instant) {
         val previousNotes =
             try { mqJson.decodeFromString(JsonArray.serializer(), raw.notesJson) }
             catch (_: SerializationException) { JsonArray(emptyList()) }
@@ -273,12 +273,17 @@ internal class MessageQueueImpl<T> internal constructor(
             return
         }
 
+        val dueAt = now + config.processingTimeout
         prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
-            statement.setInstant(1, now + config.processingTimeout)
+            statement.setInstant(1, dueAt)
             statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
             statement.setObject(3, raw.id.toJavaUuid())
             statement.executeUpdate()
         }
+        // Announced before the commit that delivers it, like every other write that makes a
+        // message available again. This consumer loops on immediately and does not need telling;
+        // another one parked on a later deadline does.
+        notify(channel, dueAt)
         commit()
     }
 
@@ -291,6 +296,7 @@ internal class MessageQueueImpl<T> internal constructor(
             notes = notes,
             source = source,
             tables = tables,
+            channel = channel,
             observers = messageObservers,
         )
 

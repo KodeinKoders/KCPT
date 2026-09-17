@@ -1,11 +1,15 @@
 package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import org.junit.Test
@@ -106,6 +110,43 @@ class UndecodablePayloadTest : AbstractPgsqlTest() {
             assertEquals(1, observer.undecodable.size, "observers must be told, with the raw payload")
             assertEquals(id, observer.undecodable.single().first)
             assertEquals(garbage, observer.undecodable.single().second)
+        }
+    }
+
+    // Rolling the message forward makes it available again at a new due_at, so it announces itself
+    // like every other write that does. The consumer that performed the roll-forward loops on
+    // immediately and needs no telling; one parked on a later deadline does. Asserted on the
+    // channel directly, so it does not rest on another consumer's timing.
+    @OptIn(kotlin.time.ExperimentalTime::class)
+    @Test
+    fun rollingAnUndecodablePayloadForwardAnnouncesTheNewDueAt() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(
+                    queue,
+                    User.serializer(),
+                    MessageQueue.Config(maxTries = 5, processingTimeout = 2.seconds),
+                )
+            dataSource.rawInsertMessage(prefix, queue, Uuid.random(), Clock.System.now() - 1.seconds, garbage)
+
+            val channel = PGChannel("${prefix}messages_$queue", kotlin.time.Instant.serializer())
+            launch {
+                val flow = dataSource.asSource().openListenConnection(this, channel)
+                val announced = kotlinx.coroutines.CompletableDeferred<kotlin.time.Instant>()
+                val collector = launch { announced.complete(flow.first()) }
+                delay(300.milliseconds) // let the collector subscribe before anything is sent
+
+                assertNull(q.tryReceive(), "nothing else is queued, so there is nothing to deliver")
+
+                assertNotNull(
+                    withTimeoutOrNull(5.seconds) { announced.await() },
+                    "the roll-forward must announce the message's new due_at on the queue's channel",
+                )
+                collector.cancel()
+                cancel()
+            }.join()
         }
     }
 

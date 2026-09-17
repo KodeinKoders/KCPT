@@ -1,6 +1,11 @@
 package net.kodein.mq.kcpmq
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Test
 import kotlin.test.assertEquals
@@ -143,6 +148,43 @@ class MessageAckTest : AbstractPgsqlTest() {
 
         assertTrue(observer.successes.isEmpty())
         assertTrue(observer.failures.isEmpty())
+    }
+
+    // A consumer already parked in receive() has no way to notice that a message became available
+    // again: it computed its wake-up deadline while the message was still leased. Both fallbacks
+    // are set far beyond this test's patience, so the only thing that can deliver the message
+    // inside the budget is the notification the requeue itself sends. Without it the retry waited
+    // out the lease deadline — and before the lease deadline existed at all, the security timer,
+    // ten minutes by default.
+    @Test
+    fun aParkedReceiveWakesWhenAMessageIsRequeued() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
+                .messageQueue(
+                    uniqueQueueName(),
+                    User.serializer(),
+                    MessageQueue.Config(
+                        maxTries = 5,
+                        processingTimeout = 60.seconds,    // lease deadline a minute-plus away
+                        securityCheckTimeout = 60.seconds, // and the security timer no nearer
+                    ),
+                )
+            q.post(User(1, "A"))
+            val held = q.tryReceive()
+            assertNotNull(held)
+
+            val waiter = async { withTimeoutOrNull(5.seconds) { q.receive() } }
+            delay(500.milliseconds) // parked, with nothing else in the queue that could wake it
+
+            held.failureRequeue()
+
+            val redelivered = waiter.await()
+            assertNotNull(
+                redelivered,
+                "a parked receive() must wake on the requeue, not sit out the lease deadline",
+            )
+            assertEquals(held.id, redelivered.id)
+        }
     }
 
     @Test
