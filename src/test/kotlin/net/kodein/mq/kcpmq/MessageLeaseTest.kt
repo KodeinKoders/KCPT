@@ -168,7 +168,7 @@ class MessageLeaseTest : AbstractPgsqlTest() {
             val held = q.tryReceive()
             assertNotNull(held)
 
-            // Without these the lease would be reclaimable after 400ms + 80ms grace.
+            // Without these the lease would be reclaimable after 400ms + the 200ms minimum grace.
             delay(300.milliseconds)
             held.extend()
             delay(300.milliseconds)

@@ -21,6 +21,14 @@ import org.postgresql.core.Utils
 import java.sql.Connection
 
 
+// getNotifications blocks for up to this long, and the listening loop only notices it has been
+// cancelled between polls — so this is also how long closing a listening connection takes. That
+// cost lands on receive(), which waits for the teardown before handing back a message whose lease
+// is already running, so it is spent out of the message's processing budget. It must therefore stay
+// well under the smallest permitted processingGrace; at 500ms it consumed the whole margin of a
+// short-timeout queue and messages were reclaimed and processed twice.
+private const val NOTIFICATION_POLL_MS: Int = 50
+
 public class PGChannel<T>(
     public val name: String,
     private val serializer: KSerializer<T>,
@@ -69,7 +77,7 @@ public class PGChannel<T>(
         val flow = channelFlow {
             runInterruptible(Dispatchers.IO) {
                 while (!Thread.currentThread().isInterrupted) {
-                    val notifications = pgConnection.getNotifications(500)?.toList() ?: emptyList()
+                    val notifications = pgConnection.getNotifications(NOTIFICATION_POLL_MS)?.toList() ?: emptyList()
                     notifications
                         .forEach { notification ->
                             val element = mqJson.decodeFromString(serializer, notification.parameter)

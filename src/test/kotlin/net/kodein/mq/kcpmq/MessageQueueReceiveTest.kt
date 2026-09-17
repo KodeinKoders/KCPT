@@ -18,6 +18,7 @@ import kotlin.test.assertTrue
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toKotlinInstant
 
 class MessageQueueReceiveTest : AbstractPgsqlTest() {
 
@@ -212,6 +213,38 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
 
             // And it is still healthy: once the lock goes, the message is delivered.
             assertNotNull(q.tryReceive(), "the message should be receivable once the lock is released")
+        }
+    }
+
+    // A message's lease starts when receive() takes it, not when the caller gets it back — so
+    // whatever receive() spends between those two points is spent out of the message's processing
+    // budget. A receive() that parked has a listening connection to tear down first, and that
+    // teardown waits for the notification poll to come round. It has to stay well under the
+    // smallest permitted processingGrace: when it did not, a queue with a short processingTimeout
+    // had its whole margin consumed here, and messages were reclaimed and worked a second time
+    // while their first worker was still going on to succeed.
+    @Test
+    fun receiveReturnsAMessagePromptlyAfterTakingItsLease() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val q = mq(prefix = prefix, config = MessageQueue.Config(processingTimeout = 10.seconds))
+
+            repeat(3) { i ->
+                val waiter = async { q.receive() to Clock.System.now() }
+                delay(400.milliseconds) // let it park, so the listening flow is actually collected
+                q.post(User(i, "u$i"))
+
+                val (message, returnedAt) = waiter.await()
+                val leasedAt = dataSource.startedAtOf(prefix, message.id)!!.toInstant().toKotlinInstant()
+                val handover = returnedAt - leasedAt
+
+                assertTrue(
+                    handover < MessageQueue.Config.MIN_PROCESSING_GRACE,
+                    "receive() held the message for $handover after leasing it, which does not fit " +
+                        "in the smallest permitted processingGrace of ${MessageQueue.Config.MIN_PROCESSING_GRACE}",
+                )
+                message.successDelete()
+            }
         }
     }
 

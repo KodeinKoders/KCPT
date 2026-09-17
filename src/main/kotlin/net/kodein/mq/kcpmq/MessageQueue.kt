@@ -19,6 +19,7 @@ import java.sql.Connection
 import java.util.*
 import kotlin.time.Clock
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
@@ -43,7 +44,9 @@ public interface MessageQueue<T> {
         // Margin added to processingTimeout before another consumer may reclaim a lease, so that a
         // worker's own processing timeout always fires first and requeues the message itself.
         // Without it the two deadlines coincide and a reclaim can race an in-flight requeue.
-        val processingGrace: Duration = processingTimeout * .2,
+        // Floored at MIN_PROCESSING_GRACE, so a short processingTimeout cannot derive a margin too
+        // small to cover the handover described there.
+        val processingGrace: Duration = maxOf(processingTimeout * .2, MIN_PROCESSING_GRACE),
     ) {
         // Every one of these fails silently rather than loudly when it is out of range, so they are
         // rejected at construction. init also covers copy(), so a config derived from a valid one
@@ -65,11 +68,25 @@ public interface MessageQueue<T> {
             require(processingTimeout > Duration.ZERO) {
                 "processingTimeout must be positive, but was $processingTimeout"
             }
-            // Negative would let a reclaim happen before the holder's own timeout fires, which
-            // inverts the guarantee the margin exists for.
-            require(processingGrace >= Duration.ZERO) {
-                "processingGrace cannot be negative, but was $processingGrace"
+            // Too small — zero included — lets a reclaim happen before the holder's own timeout
+            // fires, which inverts the guarantee the margin exists for.
+            require(processingGrace >= MIN_PROCESSING_GRACE) {
+                "processingGrace must be at least $MIN_PROCESSING_GRACE, but was $processingGrace"
             }
+        }
+
+        public companion object {
+            // A lease starts when receive() takes it, not when the worker starts working: the
+            // message still has to travel back out of receive() — which waits for its listening
+            // connection to be torn down — and the worker still has to be dispatched. The margin
+            // has to cover that handover, or the message is reclaimed and processed a second time
+            // while its first worker is still going on to succeed. Nothing fails when that happens,
+            // so it is invisible: the work is simply done twice.
+            //
+            // Teardown is bounded by PGChannel's notification poll (50ms); 200ms leaves room for
+            // that plus a busy dispatcher, while staying small next to any realistic
+            // processingTimeout.
+            public val MIN_PROCESSING_GRACE: Duration = 200.milliseconds
         }
     }
 }
