@@ -102,22 +102,15 @@ internal class MessageQueueImpl<T> internal constructor(
     private val serializer: KSerializer<T>,
     override val config: MessageQueue.Config,
     private val messageObservers: List<Message.Observer<T>>,
+    private val onUndecodableNotification:
+        (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
 ) : MessageQueue<T> {
 
     @OptIn(ExperimentalTime::class)
     private val channel = PGChannel(
         name = "${tables.messages}_$name",
         serializer = Instant.serializer(),
-        onUndecodableNotification = { channelName, payload, cause ->
-            // Each observer separately, so one that throws neither hides the others nor reaches
-            // the listening loop.
-            messageObservers.forEach {
-                try {
-                    it.onUndecodableNotification(channelName, payload, cause)
-                } catch (_: Throwable) {
-                }
-            }
-        },
+        onUndecodableNotification = onUndecodableNotification,
     )
 
     @OptIn(ExperimentalUuidApi::class)

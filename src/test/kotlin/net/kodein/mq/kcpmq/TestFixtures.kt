@@ -22,11 +22,8 @@ data class UserV2(val id: Int, val name: String, val extra: String = "x")
 class RecordingObserver<T> : Message.Observer<T> {
     data class Recorded<T>(val id: Uuid, val payload: T, val notes: JsonElement)
 
-    data class RecordedNotification(val channel: String, val payload: String, val cause: Throwable)
-
     val successes = CopyOnWriteArrayList<Recorded<T>>()
     val failures = CopyOnWriteArrayList<Recorded<T>>()
-    val undecodableNotifications = CopyOnWriteArrayList<RecordedNotification>()
 
     override fun onSuccess(id: Uuid, payload: T, notes: JsonElement) {
         successes += Recorded(id, payload, notes)
@@ -35,9 +32,16 @@ class RecordingObserver<T> : Message.Observer<T> {
     override fun onFailure(id: Uuid, payload: T, notes: JsonElement) {
         failures += Recorded(id, payload, notes)
     }
+}
 
-    override fun onUndecodableNotification(channel: String, payload: String, cause: Throwable) {
-        undecodableNotifications += RecordedNotification(channel, payload, cause)
+// Records what a sink reports about notifications it could not decode.
+class RecordingUndecodableNotifications {
+    data class Recorded(val channel: String, val payload: String, val cause: Throwable)
+
+    val recorded = CopyOnWriteArrayList<Recorded>()
+
+    val handler: (String, String, Throwable) -> Unit = { channel, payload, cause ->
+        recorded += Recorded(channel, payload, cause)
     }
 }
 

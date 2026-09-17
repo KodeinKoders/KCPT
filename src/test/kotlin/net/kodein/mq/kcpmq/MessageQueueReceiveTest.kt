@@ -258,14 +258,12 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
         withContext(Dispatchers.Default) {
             val prefix = uniquePrefix()
             val queue = uniqueQueueName()
-            val observer = RecordingObserver<User>()
-            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .messageQueue(
-                    queue,
-                    User.serializer(),
-                    MessageQueue.Config(securityCheckTimeout = 30.seconds),
-                    listOf(observer),
-                )
+            val reports = RecordingUndecodableNotifications()
+            val q = MessageQueueSink(
+                source = dataSource.asSource(),
+                tablesPrefix = prefix,
+                onUndecodableNotification = reports.handler,
+            ).messageQueue(queue, User.serializer(), MessageQueue.Config(securityCheckTimeout = 30.seconds))
 
             val waiter = async { q.receive() }
             delay(400.milliseconds) // parked, and listening
@@ -279,10 +277,11 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
             assertEquals(User(1, "A"), message.payload)
             assertEquals(
                 1,
-                observer.undecodableNotifications.size,
-                "the queue's observers must be told which producer is speaking the wrong format",
+                reports.recorded.size,
+                "the sink's handler must be told, or nothing anywhere reports the wrong wire format",
             )
-            assertEquals("not-json-at-all", observer.undecodableNotifications.single().payload)
+            assertEquals("${prefix}messages_$queue", reports.recorded.single().channel)
+            assertEquals("not-json-at-all", reports.recorded.single().payload)
         }
     }
 

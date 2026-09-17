@@ -27,11 +27,18 @@ public fun MessageQueueSink(
     tablesPrefix: String = "public.mq_",
     initializationScope: CoroutineScope? = null,
     messageObservers: List<Message.Observer<Any?>> = emptyList(),
+    // Told about a notification on a queue's channel whose payload could not be read. Such a
+    // notification is dropped — it is only ever a hint that work may be available — so without this
+    // nothing in the process would report that a producer is writing a format these consumers
+    // cannot read. The channel name embeds the queue name, so one handler can tell queues apart.
+    onUndecodableNotification: (channel: String, payload: String, cause: Throwable) -> Unit =
+        { _, _, _ -> },
 ): MessageQueueSink = MessageQueueSinkImpl(
     source = source,
     tablesPrefix = tablesPrefix,
     initializationScope = initializationScope,
     messageObservers = messageObservers,
+    onUndecodableNotification = onUndecodableNotification,
 )
 
 @OptIn(ExperimentalAtomicApi::class)
@@ -40,6 +47,8 @@ internal class MessageQueueSinkImpl(
     tablesPrefix: String,
     initializationScope: CoroutineScope?,
     private val messageObservers: List<Message.Observer<Any?>>,
+    private val onUndecodableNotification:
+        (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
 ) : MessageQueueSink {
     private val tables = MQTables.named(
         properties = "${tablesPrefix}properties",
@@ -110,6 +119,7 @@ internal class MessageQueueSinkImpl(
             serializer = serializer,
             config = config,
             messageObservers = this.messageObservers + messageObservers,
+            onUndecodableNotification = onUndecodableNotification,
         )
     }
 
