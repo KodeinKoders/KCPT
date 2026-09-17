@@ -160,6 +160,10 @@ class PGChannelTest : AbstractPgsqlTest() {
         assertFailsWith<IllegalArgumentException> { PGChannel(tooLong, Foo.serializer()) }
     }
 
+    // Poll for the pool to be clear rather than sleeping a fixed interval and sampling once. A
+    // leaked connection never comes back, so polling catches it just as surely, whereas a single
+    // timed sample is a bet that the pool has settled by then — and as a bet it flaked, roughly
+    // once in twenty suite runs, with no leak to show for it.
     @Test
     fun closingTheConnectionFlowReleasesTheConnection() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
@@ -169,8 +173,10 @@ class PGChannelTest : AbstractPgsqlTest() {
                     dataSource.asSource().openListenConnection(this, channel).use { }
                 }
             }
-            delay(200.milliseconds)
-            assertEquals(0, dataSource.hikariPoolMXBean.activeConnections)
+            awaitUntil(
+                timeout = 2.seconds,
+                message = "a closed ConnectionFlow never returned its connection to the pool",
+            ) { dataSource.hikariPoolMXBean.activeConnections == 0 }
         }
     }
 

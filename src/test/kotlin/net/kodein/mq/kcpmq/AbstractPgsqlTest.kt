@@ -47,12 +47,13 @@ abstract class AbstractPgsqlTest {
     protected suspend fun awaitUntil(
         timeout: Duration = 5.seconds,
         poll: Duration = 50.milliseconds,
+        message: String? = null,
         predicate: suspend () -> Boolean,
     ) {
         val deadline = kotlin.time.Clock.System.now() + timeout
         while (!predicate()) {
             if (kotlin.time.Clock.System.now() >= deadline) {
-                throw AssertionError("condition did not become true within $timeout")
+                throw AssertionError(message ?: "condition did not become true within $timeout")
             }
             kotlinx.coroutines.delay(poll)
         }
