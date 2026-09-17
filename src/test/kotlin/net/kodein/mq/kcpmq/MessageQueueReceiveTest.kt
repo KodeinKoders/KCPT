@@ -1,5 +1,6 @@
 package net.kodein.mq.kcpmq
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -8,7 +9,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -151,6 +154,64 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
             }
             delay(200.milliseconds)
             assertEquals(0, dataSource.hikariPoolMXBean.activeConnections)
+        }
+    }
+
+    // A message that is due but row-locked by another transaction is invisible to tryReceive, which
+    // skips locked rows. receive() must park until something changes rather than retrying in a tight
+    // loop: it derives its wake-up deadline only from messages due in the strict future, so a
+    // due-but-untakeable row can never yield a deadline that has already passed. Deriving it from
+    // messages due *now* let the wait loop fall through and the retry loop spin on the database
+    // instead — thousands of connections and round trips a second, per waiting consumer.
+    @Test
+    fun receiveDoesNotSpinWhileADueMessageIsLockedByAnotherTransaction() = runTest(timeout = 30.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+
+            // Counting wrapper: every database round trip in receive() starts with one acquisition.
+            val acquisitions = AtomicInteger(0)
+            val underlying = dataSource.asSource()
+            val countingSource: Source = { acquisitions.incrementAndGet(); underlying() }
+
+            val q = MessageQueueSink(source = countingSource, tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(securityCheckTimeout = 30.seconds))
+            q.post(User(1, "A"))
+
+            val lockHeld = CompletableDeferred<Unit>()
+            val releaseLock = CompletableDeferred<Unit>()
+            val lockJob = launch {
+                dataSource.connection.use { connection ->
+                    connection.autoCommit = false
+                    connection.prepareStatement("SELECT * FROM ${prefix}messages WHERE queue = ? FOR UPDATE").use { statement ->
+                        statement.setString(1, queue)
+                        statement.executeQuery().use { it.next() }
+                    }
+                    lockHeld.complete(Unit)
+                    releaseLock.await()
+                    connection.rollback()
+                }
+            }
+            lockHeld.await()
+
+            acquisitions.set(0)
+            val waiter = launch { withTimeoutOrNull(2.seconds) { q.receive() } }
+            delay(2.seconds)
+            val acquired = acquisitions.get()
+            waiter.join()
+
+            // A parked receive() needs a couple of connections in total; the spin used ~4400 a second.
+            assertTrue(
+                acquired < 50,
+                "receive() spun on the database while the only due message was locked: " +
+                    "$acquired connections acquired in 2s",
+            )
+
+            releaseLock.complete(Unit)
+            lockJob.join()
+
+            // And it is still healthy: once the lock goes, the message is delivered.
+            assertNotNull(q.tryReceive(), "the message should be receivable once the lock is released")
         }
     }
 

@@ -2,6 +2,7 @@
 
 package net.kodein.mq.kcpmq
 
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
@@ -141,83 +142,82 @@ internal class MessageQueueImpl<T> internal constructor(
 
     override suspend fun tryReceive(): Message<T>? = withContext(Dispatchers.IO) {
         source().use { connection ->
-            connection.transaction { receiveNext() }
+            connection.receiveNextOrNull(Clock.System.now())
         }
     }
 
-    private fun Connection.receiveNext(): Message<T>? {
-        while (true) {
-            val now = Clock.System.now()
-            // A lease is only reclaimable once the holder's own processing timeout has had the
-            // grace margin to fire and requeue the message itself.
-            val reclaimableBefore = now - (config.processingTimeout + config.processingGrace)
+    private fun Connection.receiveNextOrNull(now: Instant): Message<T>? {
+        transaction {
+            while (true) {
+                // A lease is only reclaimable once the holder's own processing timeout has had the
+                // grace margin to fire and requeue the message itself.
+                val reclaimableBefore = now - (config.processingTimeout + config.processingGrace)
 
-            val raw = prepareStatement(
-                """
-                    SELECT id, payload, notes, started_at
-                    FROM ${tables.messages}
-                    WHERE
-                            queue = ?
-                        AND due_at <= ?
-                        AND (started_at IS NULL OR started_at < ?)
-                        AND json_array_length(notes) < ?
-                    ORDER BY due_at, id
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                """.trimIndent()
-            ).use { statement ->
-                statement.setString(1, name)
-                statement.setInstant(2, now)
-                statement.setInstant(3, reclaimableBefore)
-                statement.setInt(4, config.maxTries)
-                statement.executeQuery().use { resultSet ->
-                    if (!resultSet.next()) null
-                    else RawCandidate(
-                        id = (resultSet.getObject(1) as UUID).toKotlinUuid(),
-                        payloadJson = resultSet.getString(2),
-                        notesJson = resultSet.getString(3),
-                        startedAt = resultSet.getInstantOrNull(4),
-                    )
+                val raw = prepareStatement(
+                    """
+                        SELECT id, payload, notes, started_at
+                        FROM ${tables.messages}
+                        WHERE
+                                queue = ?
+                            AND due_at <= ?
+                            AND (started_at IS NULL OR started_at < ?)
+                        ORDER BY due_at, id
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    """.trimIndent()
+                ).use { statement ->
+                    statement.setString(1, name)
+                    statement.setInstant(2, now)
+                    statement.setInstant(3, reclaimableBefore)
+                    statement.executeQuery().use { resultSet ->
+                        if (!resultSet.next()) null
+                        else RawCandidate(
+                            id = (resultSet.getObject(1) as UUID).toKotlinUuid(),
+                            payloadJson = resultSet.getString(2),
+                            notesJson = resultSet.getString(3),
+                            startedAt = resultSet.getInstantOrNull(4),
+                        )
+                    }
+                } ?: return null
+
+                // Decoding happens after the row is selected but before the lease is taken, so a
+                // payload this consumer cannot read is recorded as a failed try and skipped over
+                // rather than thrown out of the transaction — otherwise it would roll back untouched,
+                // stay first in line, and wedge the queue behind it forever.
+                val candidate = decode(raw) ?: run {
+                    recordUndecodable(raw, now)
+                    continue
                 }
-            } ?: return null
 
-            // Decoding happens after the row is selected but before the lease is taken, so a
-            // payload this consumer cannot read is recorded as a failed try and skipped over
-            // rather than thrown out of the transaction — otherwise it would roll back untouched,
-            // stay first in line, and wedge the queue behind it forever.
-            val candidate = decode(raw) ?: run {
-                recordUndecodable(raw, now)
-                continue
-            }
+                if (candidate.startedAt == null) {
+                    prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
+                        statement.setInstant(1, now)
+                        statement.setObject(2, candidate.id.toJavaUuid())
+                        statement.executeUpdate()
+                    }
+                    return message(candidate.id, candidate.payload, candidate.notes, now)
+                }
 
-            if (candidate.startedAt == null) {
-                prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
+                // An expired lease: the previous holder died without reporting, so this counts as a
+                // failed try, exactly as an explicit failureRequeue would.
+                val notes = JsonArray(candidate.notes + leaseExpiredNote)
+                if (notes.size >= config.maxTries) {
+                    prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
+                        statement.setObject(1, candidate.id.toJavaUuid())
+                        statement.executeUpdate()
+                    }
+                    commit()
+                    messageObservers.forEach { it.onFailure(candidate.id, candidate.payload, leaseExpiredNote) }
+                    continue
+                }
+                prepareStatement("UPDATE ${tables.messages} SET started_at = ?, notes = ?::json WHERE id = ?").use { statement ->
                     statement.setInstant(1, now)
-                    statement.setObject(2, candidate.id.toJavaUuid())
+                    statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
+                    statement.setObject(3, candidate.id.toJavaUuid())
                     statement.executeUpdate()
                 }
-                return message(candidate.id, candidate.payload, candidate.notes, now)
+                return message(candidate.id, candidate.payload, notes, now)
             }
-
-            // An expired lease: the previous holder died without reporting, so this counts as a
-            // failed try, exactly as an explicit failureRequeue would.
-            val notes = JsonArray(candidate.notes + leaseExpiredNote)
-            if (notes.size >= config.maxTries) {
-                prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
-                    statement.setObject(1, candidate.id.toJavaUuid())
-                    statement.executeUpdate()
-                }
-                commit()
-                messageObservers.forEach { it.onFailure(candidate.id, candidate.payload, leaseExpiredNote) }
-                continue
-            }
-            prepareStatement("UPDATE ${tables.messages} SET started_at = ?, notes = ?::json WHERE id = ?").use { statement ->
-                statement.setInstant(1, now)
-                statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
-                statement.setObject(3, candidate.id.toJavaUuid())
-                statement.executeUpdate()
-            }
-            return message(candidate.id, candidate.payload, notes, now)
         }
     }
 
@@ -276,40 +276,53 @@ internal class MessageQueueImpl<T> internal constructor(
 
     override suspend fun receive(): Message<T> =
         coroutineScope {
-            source.openListenConnection(this, channel).use { flow ->
-                var message: Message<T>?
-                do {
-                    message = tryReceive()
-                    if (message == null) {
-                        var next = source().use { connection ->
-                            connection.prepareStatement(
-                                "SELECT min(due_at) FROM ${tables.messages} WHERE queue = ? AND started_at IS NULL AND json_array_length(notes) < ?"
-                            ).use { statement ->
-                                statement.setString(1, name)
-                                statement.setInt(2, config.maxTries)
-                                statement.executeQuery().use { resultSet ->
-                                    resultSet.next()
-                                    resultSet.getInstantOrNull(1)
-                                }
-                            }
-                        } ?: run {
-                            // This timeout is a security measure in case a message was posted to the queue without
-                            // notifying the channel. This should never happen (unless some non-KCMP code writes into the
-                            // message table).
-                            // Note that if a message was posted to the queue exactly between this tryReceive and this flow
-                            // collection, the notification will still be received, as the flow was created before the
-                            // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
-                            // Postgres, and therefore all notifications sent between the flow creation and its collection
-                            // are buffered).
-                            Clock.System.now() + config.securityCheckTimeout
+            receiveNext()
+        }
+
+    private suspend fun CoroutineScope.receiveNext(): Message<T> {
+        source.openListenConnection(this, channel).use { flow ->
+            while (true) {
+                var next: Instant
+                val now = Clock.System.now()
+                source().use { connection ->
+                    val message = connection.receiveNextOrNull(now)
+                    if (message != null) return message
+
+                    // Here we take the next due message in the strict future (not including now).
+                    // If there are messages due now or in the past, we know that they are being processed since
+                    // receiveNextOrNull returned null (so they were skipped).
+                    // Note that if a new message was posted due now or in the past in the interval between the
+                    // receiveNextOrNull call and this query, it will not be caught by this query, but the loop will
+                    // immediately restart because of the notification in the channel.
+                    next = connection.prepareStatement(
+                        """
+                            SELECT min(due_at)
+                            FROM ${tables.messages}
+                            WHERE   queue = ?
+                                AND started_at IS NULL
+                                AND due_at > ?
+                            """.trimIndent()
+                    ).use { statement ->
+                        statement.setString(1, name)
+                        statement.setInstant(2, now)
+                        statement.executeQuery().use { resultSet ->
+                            resultSet.next()
+                            resultSet.getInstantOrNull(1)
                         }
-                        while (Clock.System.now() < next) {
-                            val notification = withTimeoutOrNull(next - Clock.System.now()) { flow.first() }
-                            if (notification != null && notification < next) next = notification
-                        }
+                    } ?: run {
+                        // Note that if a message was posted to the queue exactly between this tryReceive and this flow
+                        // collection, the notification will still be received, as the flow was created before the
+                        // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
+                        // Postgres, and therefore all notifications sent between the flow creation and its collection
+                        // are buffered).
+                        Clock.System.now() + config.securityCheckTimeout
                     }
-                } while (message == null)
-                message
+                }
+                while (Clock.System.now() < next) {
+                    val notification = withTimeoutOrNull(next - Clock.System.now()) { flow.first() }
+                    if (notification != null && notification < next) next = notification
+                }
             }
         }
+    }
 }
