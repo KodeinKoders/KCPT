@@ -11,6 +11,7 @@ import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -215,23 +216,34 @@ class MessageLeaseTest : AbstractPgsqlTest() {
         }
     }
 
+    // The reclaim deadline is processingTimeout + processingGrace, so a message whose timeout has
+    // passed but whose grace has not must stay with its holder. Both cases are set up by backdating
+    // started_at rather than by sleeping: the original slept 900ms into a 1.5s window, which left
+    // 600ms of slack for a delay that can only ever overrun, and under a loaded machine it did —
+    // about once in twenty suite runs. Backdating puts seconds of slack on both sides and takes no
+    // wall-clock time at all.
     @Test
     fun aLeaseIsNotReclaimableDuringTheGraceMargin() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
-            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
-                .messageQueue(
-                    uniqueQueueName(),
-                    User.serializer(),
-                    MessageQueue.Config(processingTimeout = 500.milliseconds, processingGrace = 1.seconds),
-                )
+            val prefix = uniquePrefix()
+            val config = MessageQueue.Config(processingTimeout = 1.seconds, processingGrace = 10.seconds)
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(uniqueQueueName(), User.serializer(), config)
             q.post(User(1, "A"))
-            q.tryReceive() // abandoned
 
-            delay(900.milliseconds) // past processingTimeout, still inside the grace margin
+            val held = q.tryReceive()
+            assertNotNull(held) // picked up, and deliberately never acknowledged
+            val leaseWindow = config.processingTimeout + config.processingGrace // 11s
+
+            // Well past processingTimeout, well short of the end of the grace margin.
+            dataSource.setStartedAt(prefix, held.id, Clock.System.now() - config.processingTimeout - 5.seconds)
             assertNull(q.tryReceive(), "the holder must keep the lease for the whole grace margin")
 
-            delay(900.milliseconds) // now past processingTimeout + grace
-            assertNotNull(q.tryReceive())
+            // Well past the end of the grace margin.
+            dataSource.setStartedAt(prefix, held.id, Clock.System.now() - leaseWindow - 5.seconds)
+            val reclaimed = q.tryReceive()
+            assertNotNull(reclaimed, "the lease must be reclaimable once the grace margin has passed")
+            assertEquals(held.id, reclaimed.id)
         }
     }
 }

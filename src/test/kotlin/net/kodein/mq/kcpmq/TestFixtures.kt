@@ -61,6 +61,17 @@ fun HikariDataSource.startedAtOf(prefix: String, id: Uuid): OffsetDateTime? =
         }
     }
 
+// Backdating a lease says "this message was picked up at T" without having to wait until T is in
+// the past, so a test about the lease window does not have to bet on how long a delay really took.
+fun HikariDataSource.setStartedAt(prefix: String, id: Uuid, startedAt: Instant) =
+    connection.use { connection ->
+        connection.prepareStatement("UPDATE ${prefix}messages SET started_at = ? WHERE id = ?").use { statement ->
+            statement.setInstant(1, startedAt)
+            statement.setObject(2, id.toJavaUuid())
+            statement.executeUpdate()
+        }
+    }
+
 fun HikariDataSource.dueAtOf(prefix: String, id: Uuid): OffsetDateTime? =
     connection.use { connection ->
         connection.prepareStatement("SELECT due_at FROM ${prefix}messages WHERE id = ?").use { statement ->
