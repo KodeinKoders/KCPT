@@ -21,9 +21,7 @@ import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
-import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
-import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 import kotlin.uuid.toJavaUuid
 import kotlin.uuid.toKotlinUuid
@@ -106,14 +104,12 @@ internal class MessageQueueImpl<T> internal constructor(
         (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
 ) : MessageQueue<T> {
 
-    @OptIn(ExperimentalTime::class)
     private val channel = PGChannel(
         name = "${tables.messages}_$name",
         serializer = Instant.serializer(),
         onUndecodableNotification = onUndecodableNotification,
     )
 
-    @OptIn(ExperimentalUuidApi::class)
     override suspend fun post(
         value: T,
         due: Instant?,

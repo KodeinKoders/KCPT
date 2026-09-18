@@ -8,7 +8,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.serialization.KSerializer
 import kotlin.concurrent.atomics.AtomicReference
-import kotlin.concurrent.atomics.ExperimentalAtomicApi
 
 
 public interface MessageQueueSink {
@@ -41,7 +40,6 @@ public fun MessageQueueSink(
     onUndecodableNotification = onUndecodableNotification,
 )
 
-@OptIn(ExperimentalAtomicApi::class)
 internal class MessageQueueSinkImpl(
     private val source: Source,
     tablesPrefix: String,

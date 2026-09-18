@@ -11,7 +11,6 @@ import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toKotlinInstant
-import kotlin.uuid.ExperimentalUuidApi
 
 class MessageQueuePostTryReceiveTest : AbstractPgsqlTest() {
 

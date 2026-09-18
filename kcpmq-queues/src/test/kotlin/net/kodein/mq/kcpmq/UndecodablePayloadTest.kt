@@ -158,7 +158,6 @@ class UndecodablePayloadTest : AbstractPgsqlTest() {
     // like every other write that does. The consumer that performed the roll-forward loops on
     // immediately and needs no telling; one parked on a later deadline does. Asserted on the
     // channel directly, so it does not rest on another consumer's timing.
-    @OptIn(kotlin.time.ExperimentalTime::class)
     @Test
     fun rollingAnUndecodablePayloadForwardAnnouncesTheNewDueAt() = runTest(timeout = 20.seconds) {
         withContext(Dispatchers.Default) {

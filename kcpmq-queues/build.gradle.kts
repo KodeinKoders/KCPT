@@ -7,6 +7,16 @@ plugins {
 kotlin {
     jvmToolchain(findProperty("jvm.toolchain")!!.toString().toInt())
     explicitApi()
+
+    compilerOptions {
+        optIn.addAll(
+            "kotlin.concurrent.atomics.ExperimentalAtomicApi",
+            "kotlin.contracts.ExperimentalContracts",
+            "kotlin.time.ExperimentalTime",
+            "kotlin.uuid.ExperimentalUuidApi",
+            "kotlinx.coroutines.ExperimentalCoroutinesApi",
+        )
+    }
 }
 
 dependencies {

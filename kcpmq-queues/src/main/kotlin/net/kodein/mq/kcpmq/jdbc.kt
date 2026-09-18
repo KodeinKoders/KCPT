@@ -5,16 +5,13 @@ import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
-import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.InvocationKind
 import kotlin.contracts.contract
-import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
 import kotlin.time.toJavaInstant
 import kotlin.time.toKotlinInstant
 
 
-@OptIn(ExperimentalContracts::class)
 internal inline fun <R> Connection.transaction(
     block: Connection.() -> R
 ): R {
