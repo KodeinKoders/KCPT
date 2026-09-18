@@ -286,15 +286,34 @@ class MessageQueueReceiveTest : AbstractPgsqlTest() {
     }
 
     @Test
-    fun concurrentReceiversEachGetADistinctMessage() = runTest(timeout = 8.seconds) {
+    // Losing a notification here is a race, so one park-and-burst round detects it only sometimes;
+    // ten rounds make it near-certain. The queue keeps the default securityCheckTimeout, so a
+    // notification is the only way a round can complete within its deadline — a receiver that
+    // misses one sits for ten minutes, and the per-round timeout below turns that into a failure
+    // naming the round rather than a stalled suite.
+    fun concurrentReceiversEachGetADistinctMessage() = runTest(timeout = 30.seconds) {
         withContext(Dispatchers.Default) {
             val q = mq()
-            val receivers = (0..3).map { async { q.receive().payload } }
-            delay(300.milliseconds)
-            (0..3).forEach { q.post(User(it, "u$it")) }
+            repeat(10) { round ->
+                val expected = (0..3).map { User(round * 4 + it, "u${round * 4 + it}") }
+                val receivers = (0..3).map { async { q.receive().payload } }
+                try {
+                    delay(300.milliseconds)
+                    expected.forEach { q.post(it) }
 
-            val received = receivers.awaitAll()
-            assertEquals((0..3).map { User(it, "u$it") }.toSet(), received.toSet())
+                    val received = withTimeoutOrNull(5.seconds) { receivers.awaitAll() }
+                    assertNotNull(
+                        received,
+                        "round $round: a receiver was still parked 5s after the posts, so its " +
+                            "notification was lost",
+                    )
+                    assertEquals(expected.toSet(), received.toSet())
+                } finally {
+                    // A round that failed leaves receivers parked, and the enclosing scope would
+                    // wait on them instead of reporting the failure.
+                    receivers.forEach { it.cancel() }
+                }
+            }
         }
     }
 }

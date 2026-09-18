@@ -8,8 +8,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
@@ -50,6 +52,15 @@ public class PGChannel<T>(
         }
     }
 
+    /**
+     * The notifications arriving on a listening connection.
+     *
+     * Collect it once, for as long as the notifications are wanted. Sharing is eager and keeps no
+     * replay, so a notification emitted while nothing is collecting is dropped rather than held:
+     * a collector that resubscribes per event — `while (true) { flow.first() }` — is deaf between
+     * events, and whatever arrives in that window is lost. Hold one collection across the work
+     * instead, with [produceIn][kotlinx.coroutines.flow.produceIn] or your own buffering collector.
+     */
     public class ConnectionFlow<T> internal constructor(
         private val job: Job,
         private val flow: Flow<T>
@@ -109,11 +120,6 @@ public class PGChannel<T>(
                             .forEach { notification ->
                                 // Ignore stale notifications.
                                 if (notification.name == name) {
-                                    // A notification is only ever a hint that work may be
-                                    // available, so one whose payload cannot be read is dropped
-                                    // rather than propagated. Letting it out would fail this flow,
-                                    // and with it every consumer collecting it — and NOTIFY is
-                                    // open to any role that can reach the database.
                                     val element =
                                         try {
                                             mqJson.decodeFromString(serializer, notification.parameter)
@@ -128,9 +134,11 @@ public class PGChannel<T>(
                 }
             }
         }
+            .shareIn(connectionScope, SharingStarted.Eagerly)
+            .buffer(Channel.UNLIMITED)
         return ConnectionFlow(
             job = connectionJob,
-            flow = flow.shareIn(connectionScope, SharingStarted.WhileSubscribed()),
+            flow = flow,
         )
     }
 

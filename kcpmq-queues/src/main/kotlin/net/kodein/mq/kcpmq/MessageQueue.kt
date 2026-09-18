@@ -4,8 +4,9 @@ package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.consume
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
@@ -321,73 +322,83 @@ internal class MessageQueueImpl<T> internal constructor(
 
     private suspend fun CoroutineScope.receiveNext(): Message<T> {
         source.openListenConnection(this, channel).use { flow ->
-            while (true) {
-                // Every statement below blocks the thread it runs on, and receive() is the hot path of every
-                // consumer: workerPool calls it from Dispatchers.Default, whose threads the application needs for
-                // its own coroutines. Only the database work moves — the wait loop below stays outside, since
-                // parking there would hold an IO thread for as long as each idle consumer waits.
-                val attempt = withContext(Dispatchers.IO) {
-                    val now = Clock.System.now()
-                    source().use { connection ->
-                        val message = connection.receiveNextOrNull(now)
-                        if (message != null) return@use ReceiveAttempt.Took(message)
-                        val lease = config.processingTimeout + config.processingGrace
-                        val leaseExpiresWhenStartedAt = now - lease
-                        // Here we take the next due message in the strict future (not including now).
-                        // If there are messages due now or in the past, we know that they are being processed since
-                        // receiveNextOrNull returned null (so they were skipped).
-                        // Note that if a new message was posted due now or in the past in the interval between the
-                        // receiveNextOrNull call and this query, it will not be caught by this query, but the loop will
-                        // immediately restart because of the notification in the channel.
-                        val next = connection.prepareStatement(
-                            """
-                                SELECT LEAST(
-                                    (
-                                        SELECT min(due_at)
-                                        FROM ${tables.messages}
-                                        WHERE
-                                                queue = ?
-                                            AND started_at IS NULL
-                                            AND due_at > ?
-                                    ),
-                                    (
-                                        SELECT min(started_at)
-                                        FROM ${tables.messages}
-                                        WHERE
-                                                queue = ?
-                                            AND started_at IS NOT NULL
-                                            AND started_at > ?
-                                    ) + ?::interval
-                                )
-                                """.trimIndent()
-                        ).use { statement ->
-                            statement.setString(1, name)
-                            statement.setInstant(2, now)
-                            statement.setString(3, name)
-                            statement.setInstant(4, leaseExpiresWhenStartedAt)
-                            statement.setString(5, "${lease.inWholeMilliseconds} ms")
-                            statement.executeQuery().use { resultSet ->
-                                resultSet.next()
-                                resultSet.getInstantOrNull(1)
+            // One subscription for the whole call, not one per wait. The notifications are shared through a
+            // SharedFlow with no replay, which drops whatever it emits while nothing is collecting — so a
+            // wait loop that resubscribes per notification is deaf for the whole of each database round trip
+            // between them, and a message posted in that window was discoverable only by the security timer,
+            // minutes later. Holding one subscription across the call buffers what arrives while the database
+            // work below is in flight.
+            val notifications = flow.produceIn(this)
+            notifications.consume {
+                while (true) {
+                    // Every statement below blocks the thread it runs on, and receive() is the hot path of every
+                    // consumer: workerPool calls it from Dispatchers.Default, whose threads the application needs for
+                    // its own coroutines. Only the database work moves — the wait loop below stays outside, since
+                    // parking there would hold an IO thread for as long as each idle consumer waits.
+                    val attempt = withContext(Dispatchers.IO) {
+                        val now = Clock.System.now()
+                        source().use { connection ->
+                            val message = connection.receiveNextOrNull(now)
+                            if (message != null) return@use ReceiveAttempt.Took(message)
+                            val lease = config.processingTimeout + config.processingGrace
+                            val leaseExpiresWhenStartedAt = now - lease
+                            // Here we take the next due message in the strict future (not including now).
+                            // If there are messages due now or in the past, we know that they are being processed since
+                            // receiveNextOrNull returned null (so they were skipped).
+                            // Note that if a new message was posted due now or in the past in the interval between the
+                            // receiveNextOrNull call and this query, it will not be caught by this query, but the loop will
+                            // immediately restart because of the notification in the channel.
+                            val next = connection.prepareStatement(
+                                """
+                                    SELECT LEAST(
+                                        (
+                                            SELECT min(due_at)
+                                            FROM ${tables.messages}
+                                            WHERE
+                                                    queue = ?
+                                                AND started_at IS NULL
+                                                AND due_at > ?
+                                        ),
+                                        (
+                                            SELECT min(started_at)
+                                            FROM ${tables.messages}
+                                            WHERE
+                                                    queue = ?
+                                                AND started_at IS NOT NULL
+                                                AND started_at > ?
+                                        ) + ?::interval
+                                    )
+                                    """.trimIndent()
+                            ).use { statement ->
+                                statement.setString(1, name)
+                                statement.setInstant(2, now)
+                                statement.setString(3, name)
+                                statement.setInstant(4, leaseExpiresWhenStartedAt)
+                                statement.setString(5, "${lease.inWholeMilliseconds} ms")
+                                statement.executeQuery().use { resultSet ->
+                                    resultSet.next()
+                                    resultSet.getInstantOrNull(1)
+                                }
+                            } ?: run {
+                                // Note that if a message was posted to the queue exactly between this tryReceive and
+                                // this query, the notification will still be received: the subscription is opened
+                                // above, before any of this database work, and held for the whole call, so a
+                                // notification arriving while these statements run is buffered by it rather than
+                                // dropped.
+                                Clock.System.now() + config.securityCheckTimeout
                             }
-                        } ?: run {
-                            // Note that if a message was posted to the queue exactly between this tryReceive and this flow
-                            // collection, the notification will still be received, as the flow was created before the
-                            // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
-                            // Postgres, and therefore all notifications sent between the flow creation and its collection
-                            // are buffered).
-                            Clock.System.now() + config.securityCheckTimeout
+                            ReceiveAttempt.WaitUntil(next)
                         }
-                        ReceiveAttempt.WaitUntil(next)
                     }
-                }
-                var next = when (attempt) {
-                    is ReceiveAttempt.Took -> return attempt.message
-                    is ReceiveAttempt.WaitUntil -> attempt.instant
-                }
-                while (Clock.System.now() < next) {
-                    val notification = withTimeoutOrNull(next - Clock.System.now()) { flow.first() }
-                    if (notification != null && notification < next) next = notification
+                    var next = when (attempt) {
+                        is ReceiveAttempt.Took -> return attempt.message
+                        is ReceiveAttempt.WaitUntil -> attempt.instant
+                    }
+                    while (Clock.System.now() < next) {
+                        val notification =
+                            withTimeoutOrNull(next - Clock.System.now()) { notifications.receive() }
+                        if (notification != null && notification < next) next = notification
+                    }
                 }
             }
         }
