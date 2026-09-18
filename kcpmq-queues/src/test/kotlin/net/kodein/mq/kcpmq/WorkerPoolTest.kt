@@ -108,6 +108,22 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
+    // The pool passes its own timeout down to process(), which applies the same bound again. When
+    // that timeout is shorter than the queue's processingTimeout, checking only against the queue's
+    // let a keepalive through here and threw from inside a launched worker instead — after a message
+    // had been received and leased, and fatally, since that exception cancels the pool's scope.
+    @Test
+    fun workerPoolRejectsKeepaliveNotLessThanItsOwnShorterTimeout() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 60.seconds))
+
+            assertFailsWith<IllegalArgumentException> {
+                q.workerPool(timeout = 30.seconds, keepalive = 45.seconds) { null }
+            }
+        }
+    }
+
     @Test
     fun workerPoolSurvivesAThrowingWorkLambda() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {

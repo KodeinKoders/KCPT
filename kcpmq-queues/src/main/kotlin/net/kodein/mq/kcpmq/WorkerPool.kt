@@ -18,6 +18,7 @@ public suspend fun <T> MessageQueue<T>.workerPool(
     process: suspend (Message<T>) -> JsonElement?
 ): Nothing {
     require(keepalive == null || keepalive < config.processingTimeout) { "Worker pool keepalive must be less than message queue processing timeout" }
+    require(keepalive == null || keepalive < timeout) { "Worker pool keepalive must be less than Worker pool processing timeout" }
     newFixedThreadPoolContext(numberOfThreads, "KCPMQ-WorkerPool").use { dispatcher ->
         val semaphore = Semaphore(numberOfWorkers)
         coroutineScope {
