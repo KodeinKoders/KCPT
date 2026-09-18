@@ -301,61 +301,79 @@ internal class MessageQueueImpl<T> internal constructor(
             receiveNext()
         }
 
+    // One pass of receiveNext's database work either takes a message or works out when the next one can become
+    // available. Both outcomes leave the Dispatchers.IO block as a value because withContext's lambda is not
+    // inline: the early return this code used to do from the middle of the block cannot cross it.
+    private sealed interface ReceiveAttempt<T> {
+        class Took<T>(val message: Message<T>) : ReceiveAttempt<T>
+        class WaitUntil<T>(val instant: Instant) : ReceiveAttempt<T>
+    }
+
     private suspend fun CoroutineScope.receiveNext(): Message<T> {
         source.openListenConnection(this, channel).use { flow ->
             while (true) {
-                var next: Instant
-                val now = Clock.System.now()
-                source().use { connection ->
-                    val message = connection.receiveNextOrNull(now)
-                    if (message != null) return message
-                    val lease = config.processingTimeout + config.processingGrace
-                    val leaseExpiresWhenStartedAt = now - lease
-                    // Here we take the next due message in the strict future (not including now).
-                    // If there are messages due now or in the past, we know that they are being processed since
-                    // receiveNextOrNull returned null (so they were skipped).
-                    // Note that if a new message was posted due now or in the past in the interval between the
-                    // receiveNextOrNull call and this query, it will not be caught by this query, but the loop will
-                    // immediately restart because of the notification in the channel.
-                    next = connection.prepareStatement(
-                        """
-                            SELECT LEAST(
-                                (
-                                    SELECT min(due_at)
-                                    FROM ${tables.messages}
-                                    WHERE
-                                            queue = ?
-                                        AND started_at IS NULL
-                                        AND due_at > ?
-                                ),
-                                (
-                                    SELECT min(started_at)
-                                    FROM ${tables.messages}
-                                    WHERE
-                                            queue = ?
-                                        AND started_at IS NOT NULL
-                                        AND started_at > ?
-                                ) + ?::interval
-                            )
-                            """.trimIndent()
-                    ).use { statement ->
-                        statement.setString(1, name)
-                        statement.setInstant(2, now)
-                        statement.setString(3, name)
-                        statement.setInstant(4, leaseExpiresWhenStartedAt)
-                        statement.setString(5, "${lease.inWholeMilliseconds} ms")
-                        statement.executeQuery().use { resultSet ->
-                            resultSet.next()
-                            resultSet.getInstantOrNull(1)
+                // Every statement below blocks the thread it runs on, and receive() is the hot path of every
+                // consumer: workerPool calls it from Dispatchers.Default, whose threads the application needs for
+                // its own coroutines. Only the database work moves — the wait loop below stays outside, since
+                // parking there would hold an IO thread for as long as each idle consumer waits.
+                val attempt = withContext(Dispatchers.IO) {
+                    val now = Clock.System.now()
+                    source().use { connection ->
+                        val message = connection.receiveNextOrNull(now)
+                        if (message != null) return@use ReceiveAttempt.Took(message)
+                        val lease = config.processingTimeout + config.processingGrace
+                        val leaseExpiresWhenStartedAt = now - lease
+                        // Here we take the next due message in the strict future (not including now).
+                        // If there are messages due now or in the past, we know that they are being processed since
+                        // receiveNextOrNull returned null (so they were skipped).
+                        // Note that if a new message was posted due now or in the past in the interval between the
+                        // receiveNextOrNull call and this query, it will not be caught by this query, but the loop will
+                        // immediately restart because of the notification in the channel.
+                        val next = connection.prepareStatement(
+                            """
+                                SELECT LEAST(
+                                    (
+                                        SELECT min(due_at)
+                                        FROM ${tables.messages}
+                                        WHERE
+                                                queue = ?
+                                            AND started_at IS NULL
+                                            AND due_at > ?
+                                    ),
+                                    (
+                                        SELECT min(started_at)
+                                        FROM ${tables.messages}
+                                        WHERE
+                                                queue = ?
+                                            AND started_at IS NOT NULL
+                                            AND started_at > ?
+                                    ) + ?::interval
+                                )
+                                """.trimIndent()
+                        ).use { statement ->
+                            statement.setString(1, name)
+                            statement.setInstant(2, now)
+                            statement.setString(3, name)
+                            statement.setInstant(4, leaseExpiresWhenStartedAt)
+                            statement.setString(5, "${lease.inWholeMilliseconds} ms")
+                            statement.executeQuery().use { resultSet ->
+                                resultSet.next()
+                                resultSet.getInstantOrNull(1)
+                            }
+                        } ?: run {
+                            // Note that if a message was posted to the queue exactly between this tryReceive and this flow
+                            // collection, the notification will still be received, as the flow was created before the
+                            // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
+                            // Postgres, and therefore all notifications sent between the flow creation and its collection
+                            // are buffered).
+                            Clock.System.now() + config.securityCheckTimeout
                         }
-                    } ?: run {
-                        // Note that if a message was posted to the queue exactly between this tryReceive and this flow
-                        // collection, the notification will still be received, as the flow was created before the
-                        // [tryReceive]. (Creating the flow with [openListenConnection] opens the connection to
-                        // Postgres, and therefore all notifications sent between the flow creation and its collection
-                        // are buffered).
-                        Clock.System.now() + config.securityCheckTimeout
+                        ReceiveAttempt.WaitUntil(next)
                     }
+                }
+                var next = when (attempt) {
+                    is ReceiveAttempt.Took -> return attempt.message
+                    is ReceiveAttempt.WaitUntil -> attempt.instant
                 }
                 while (Clock.System.now() < next) {
                     val notification = withTimeoutOrNull(next - Clock.System.now()) { flow.first() }

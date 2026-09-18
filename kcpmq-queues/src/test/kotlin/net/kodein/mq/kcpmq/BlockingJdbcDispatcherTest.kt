@@ -47,9 +47,12 @@ class BlockingJdbcDispatcherTest : AbstractPgsqlTest() {
         } as Connection
     }
 
-    private suspend fun message(executedOn: MutableList<String>): Message<User> {
-        val mq = MessageQueueSink(source = recordingSource(executedOn), tablesPrefix = uniquePrefix())
+    private suspend fun queue(executedOn: MutableList<String>): MessageQueue<User> =
+        MessageQueueSink(source = recordingSource(executedOn), tablesPrefix = uniquePrefix())
             .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(maxTries = 5))
+
+    private suspend fun message(executedOn: MutableList<String>): Message<User> {
+        val mq = queue(executedOn)
         mq.post(User(1, "A"))
         return mq.tryReceive()!!
     }
@@ -110,6 +113,22 @@ class BlockingJdbcDispatcherTest : AbstractPgsqlTest() {
                 val message = message(executedOn)
                 executedOn.clear()
                 message.extend()
+            }
+            assertNothingRanOnTheCallerThread(executedOn)
+        }
+    }
+
+    // A message is posted first, so receive() takes it on its first pass and never reaches the
+    // wait loop — what is under test is its database work, not its parking.
+    @Test
+    fun receiveDoesNotBlockTheCallersThread() = runTest(timeout = 15.seconds) {
+        newSingleThreadContext(callerThread).use { caller ->
+            val executedOn = CopyOnWriteArrayList<String>()
+            withContext(caller) {
+                val mq = queue(executedOn)
+                mq.post(User(1, "A"))
+                executedOn.clear()
+                mq.receive()
             }
             assertNothingRanOnTheCallerThread(executedOn)
         }
