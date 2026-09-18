@@ -124,7 +124,7 @@ internal class MessageQueueImpl<T> internal constructor(
     override suspend fun post(
         value: T,
         due: Instant?,
-    ) = withContext(Dispatchers.IO) {
+    ) {
         val serializedValue = mqJson.encodeToString(serializer, value)
         val id = Uuid.generateV7()
         val dueAt = due ?: Clock.System.now()
