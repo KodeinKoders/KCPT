@@ -116,11 +116,6 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         }
     }
 
-    // [FAIL bug 8] Two independent MessageQueueSink instances racing the DDL migration: Setup.kt's
-    // CREATE TABLE (no IF NOT EXISTS, no advisory lock) is not safe under concurrent first-time init.
-    // A start-gate barrier plus 16 concurrent sinks makes this fail the large majority of the time,
-    // but it is a genuine timing race and may occasionally pass — that is expected for this class
-    // of bug and is not a sign the test itself is wrong.
     @Test
     fun concurrentInitializeAcrossIndependentSinksSucceeds() = runTest(timeout = 5.seconds) {
         val prefix = uniquePrefix()
@@ -141,8 +136,6 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         }
     }
 
-    // [FAIL bug 9] MessageQueueSink.kt's fast path calls Job.join(), which does not rethrow — a
-    // failed first migration should not be cached as a successful one.
     @Test
     fun failedInitializeIsNotCachedAsSuccess() = runTest(timeout = 5.seconds) {
         // A schema that does not exist and cannot be auto-created: migration must fail every time.

@@ -168,9 +168,6 @@ class MessageQueuePostTryReceiveTest : AbstractPgsqlTest() {
         assertEquals(posted, received)
     }
 
-    // [FAIL bug 7] tryReceive (MessageQueue.kt) decodes with the bare default Json, not mqJson
-    // (which sets ignoreUnknownKeys = true, and is what post() encodes with) — a payload with an
-    // extra field the receiving serializer doesn't know about should decode leniently.
     @Test
     fun payloadWithUnknownFieldsIsDecodedLeniently() = runTest(timeout = 5.seconds) {
         val prefix = uniquePrefix()

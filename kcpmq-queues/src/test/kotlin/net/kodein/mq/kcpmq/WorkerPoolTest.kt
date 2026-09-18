@@ -108,8 +108,6 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
-    // [FAIL bug 5] workerPool has no catch around work(), only finally — one throwing handler
-    // cancels the whole pool. Other already-posted messages should still be processed.
     @Test
     fun workerPoolSurvivesAThrowingWorkLambda() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
@@ -139,8 +137,6 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
-    // [FAIL bug 6] withTimeoutOrNull returning null in workMessage does nothing — the message is
-    // neither acked nor requeued, it is simply lost.
     @Test
     fun workerPoolRequeuesAMessageThatExceedsWorkTimeout() = runTest(timeout = 10.seconds) {
         withContext(Dispatchers.Default) {
