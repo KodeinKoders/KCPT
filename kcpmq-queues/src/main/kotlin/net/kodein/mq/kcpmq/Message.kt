@@ -79,6 +79,13 @@ internal class MessageImpl<T>(
     private val observers: List<Message.Observer<T>> = emptyList(),
 ) : Message<T> {
 
+    // extend() writes this from Dispatchers.IO while the worker reads it from wherever it is
+    // running — process()'s default timeout is derived from it, and it is public API besides. With
+    // a keepalive configured the two run concurrently for the whole of the work, and nothing else
+    // establishes a happens-before edge between them, so without @Volatile a reader can go on
+    // seeing an indefinitely stale deadline. The value is only ever written whole, never
+    // compound-updated, so volatile is enough.
+    @Volatile
     override var expiresAt: Instant = receivedAt + mqConfig.processingTimeout
         private set
 
