@@ -1,7 +1,9 @@
 package net.kodein.mq.kcpmq
 
 import com.zaxxer.hikari.HikariDataSource
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -14,8 +16,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
-import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
+import org.junit.Test
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
@@ -301,6 +304,59 @@ class PGChannelTest : AbstractPgsqlTest() {
                 flow.closeAndJoin()
                 assertEquals(0, dataSource.hikariPoolMXBean.activeConnections)
             }
+        }
+    }
+
+    // workerPool calls receive() in a loop, so cancelling the pool routinely lands on a call that is
+    // only just opening its listening connection. The scope passed here is deliberately not the
+    // caller's, which is what makes the timing exact rather than a race to reproduce.
+    @Test
+    fun openListenConnectionOnAnAlreadyCancelledScopeTakesNoConnection() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val channel = PGChannel("cancelled_${uniqueQueueName()}", Foo.serializer())
+            // HikariCP builds its pool on first use, and the whole point here is that nothing ever
+            // asks for a connection — without this the assertion below reads a null MXBean.
+            dataSource.connection.use { }
+            val cancelled = CoroutineScope(Job().apply { cancel() })
+
+            assertFailsWith<CancellationException> {
+                dataSource.asSource().openListenConnection(cancelled, channel)
+            }
+
+            delay(200.milliseconds)
+            assertEquals(
+                0,
+                dataSource.hikariPoolMXBean.activeConnections,
+                "a connection was taken for a scope that was already cancelled, and never given back",
+            )
+        }
+    }
+
+    // The harder half: the scope is live when the connection is acquired and cancelled before the
+    // teardown is armed. A coroutine cancelled before it starts never runs its body, so a teardown
+    // armed after that point would never return this connection to the pool.
+    @Test
+    fun openListenConnectionReleasesItsConnectionWhenTheScopeDiesWhileOpening() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val channel = PGChannel("dying_${uniqueQueueName()}", Foo.serializer())
+            val scope = CoroutineScope(Job())
+            val underlying = dataSource.asSource()
+            // Cancels the scope in the one window the production code cannot observe: after the
+            // connection is handed over, before anything is watching it.
+            val source: Source = { underlying().also { scope.cancel() } }
+
+            try {
+                source.openListenConnection(scope, channel)
+            } catch (_: CancellationException) {
+                // Either outcome is acceptable; what matters is the connection below.
+            }
+
+            delay(200.milliseconds)
+            assertEquals(
+                0,
+                dataSource.hikariPoolMXBean.activeConnections,
+                "the connection was acquired but never given back after the scope died mid-open",
+            )
         }
     }
 }

@@ -3,12 +3,15 @@
 package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.buffer
@@ -83,14 +86,42 @@ public class PGChannel<T>(
     }
 
     public suspend fun openListenConnection(scope: CoroutineScope, source: Source): ConnectionFlow<T> {
+        // Everything below wires one connection to one scope, and half-done is worse than not at
+        // all. A scope that is already cancelled is the ordinary case at shutdown — workerPool
+        // cancels while receive() is looping — so refuse before taking a connection from the pool.
+        scope.ensureActive()
+
         val connection = source()
+
+        // LISTEN before the teardown is armed, so nothing can close this connection while the
+        // statement is in flight. The other order let a cancelling receive() fail with
+        // PSQLException("This statement has been closed") instead of CancellationException, and
+        // workerPool reads that as a genuine failure and takes every in-flight worker down with it.
+        // Until the teardown exists this function is the connection's only owner, so whatever is
+        // thrown here is its to clean up — under NonCancellable, since the throw is usually the
+        // cancellation that would otherwise skip the close being unwound for.
+        try {
+            withContext(Dispatchers.IO) {
+                connection.prepareStatement("LISTEN $quotedName").use { it.execute() }
+            }
+        } catch (cause: Throwable) {
+            withContext(Dispatchers.IO + NonCancellable) { connection.close() }
+            throw cause
+        }
 
         val connectionJob = Job(scope.coroutineContext[Job])
         val connectionScope = CoroutineScope(scope.coroutineContext + connectionJob)
 
         val connectionMutex = Mutex()
 
-        connectionScope.launch {
+        // The ATOMIC start below is what takes the DelicateCoroutinesApi opt-in: that coroutine exists
+        // only to give the connection back, and a coroutine cancelled before it starts never runs its
+        // body at all — so started normally it would skip its own finally and strand the connection
+        // acquired just above for the life of the process. This is the case the coroutines
+        // documentation names for ATOMIC: a resource taken outside the coroutine is still released when
+        // cancellation lands between taking it and the launch.
+        @OptIn(DelicateCoroutinesApi::class)
+        connectionScope.launch(start = CoroutineStart.ATOMIC) {
             try {
                 awaitCancellation()
             } finally {
@@ -104,10 +135,6 @@ public class PGChannel<T>(
                     }
                 }
             }
-        }
-
-        withContext(Dispatchers.IO) {
-            connection.prepareStatement("LISTEN $quotedName").use { it.execute() }
         }
 
         val flow = channelFlow {
