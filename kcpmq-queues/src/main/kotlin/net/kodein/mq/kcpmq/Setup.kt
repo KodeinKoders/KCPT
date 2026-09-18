@@ -78,6 +78,18 @@ internal object Setup {
                 val targetVersion = mqMigrations.size
                 var currentVersion = getProperty(Property.SchemaVersion) ?: 0
 
+                // A version beyond what this build knows how to migrate to means the tables were
+                // migrated by a newer release. The loop below would simply not run and report
+                // success, leaving this process reading and writing a schema it does not
+                // understand — surfacing later as malformed data or an unexpected SQLException on
+                // the hot path, far from the cause. During a rolling deployment that is the
+                // expected topology, not an edge case, so it fails here instead.
+                check(currentVersion <= targetVersion) {
+                    "${tables.messages} is at schema version $currentVersion, but this version of " +
+                        "KCPMQ only knows up to $targetVersion: these tables have been migrated by " +
+                        "a newer release and cannot be used by this one"
+                }
+
                 while (currentVersion < targetVersion) {
                     mqMigrations[currentVersion].forEach { statement ->
                         prepareStatement(statement.sql(tables).trimIndent()).use {
