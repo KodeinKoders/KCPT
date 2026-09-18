@@ -1,21 +1,22 @@
-pluginManagement {
+dependencyResolutionManagement {
+    @Suppress("UnstableApiUsage")
     repositories {
-        mavenLocal()
-        gradlePluginPortal()
         mavenCentral()
     }
 }
 
 plugins {
+    // Downloads the JDKs the subprojects' toolchains ask for. Pinned here rather than in
+    // gradle/libs.versions.toml because a settings plugin can't resolve a version-catalog alias -
+    // the catalog isn't built yet at this point.
+    // https://github.com/gradle/foojay-toolchains/releases
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
-@Suppress("UnstableApiUsage")
-dependencyResolutionManagement {
-    repositories {
-        mavenLocal()
-        mavenCentral()
-    }
-}
-
 rootProject.name = "KCPMQ"
+
+enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
+
+include(
+    ":kcpmq-queues",
+)

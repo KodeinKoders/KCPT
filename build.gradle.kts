@@ -1,28 +1,46 @@
+import com.vanniktech.maven.publish.MavenPublishBaseExtension
+import org.gradle.kotlin.dsl.configure
+
 plugins {
-    alias(libs.plugins.kotlin.jvm)
-    alias(libs.plugins.kotlin.plugin.serialization)
+    alias(libs.plugins.kotlin.jvm) apply false
+    alias(libs.plugins.kotlin.plugin.serialization) apply false
+    alias(libs.plugins.mavenPublish) apply false
 }
 
-group = "net.kodein.mq.kcpmq"
-version = "1.0-SNAPSHOT"
-
-kotlin {
-    explicitApi()
+allprojects {
+    group = "net.kodein.mq.kcpmq"
+    version = "1.0-SNAPSHOT"
 }
 
-dependencies {
-    implementation(libs.kotlinx.serialization.json)
-    implementation(libs.kotlinx.coroutines)
-    implementation(libs.postgresql)
-
-    testImplementation(libs.kotlin.test)
-    testImplementation(libs.kotlin.test.junit)
-    testImplementation(libs.kotlinx.coroutines.test)
-    testImplementation(libs.hikaricp)
-    testImplementation(libs.testcontainers)
-    testImplementation(libs.testcontainers.postgresql)
-}
-
-kotlin {
-    jvmToolchain(21)
+val mavenPublishPluginId = libs.plugins.mavenPublish.get().pluginId
+subprojects {
+    pluginManager.withPlugin(mavenPublishPluginId) {
+        extensions.configure<MavenPublishBaseExtension> {
+            pom {
+                url = "https://github.com/kodein-koders/KCPMQ"
+                licenses {
+                    license {
+                        name = "MIT License"
+                        url = "https://opensource.org/licenses/MIT"
+                        distribution = "repo"
+                    }
+                }
+                issueManagement {
+                    system.set("Github")
+                    url.set("https://github.com/kodein-koders/KCPMQ/issues")
+                }
+                scm {
+                    connection.set("https://github.com/kodein-koders/KCPMQ.git")
+                    url.set("https://github.com/kodein-koders/KCPMQ")
+                }
+                developers {
+                    developer {
+                        name = "Kodein Koders"
+                        email = "contact@kodein.net"
+                        url = "https://kodein-koders.com"
+                    }
+                }
+            }
+        }
+    }
 }

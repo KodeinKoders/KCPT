@@ -1,0 +1,38 @@
+plugins {
+    alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.plugin.serialization)
+    alias(libs.plugins.mavenPublish)
+}
+
+kotlin {
+    jvmToolchain(findProperty("jvm.toolchain")!!.toString().toInt())
+    explicitApi()
+}
+
+dependencies {
+    // Flow and CoroutineScope appear in this module's own public signatures
+    // (PGChannel.ConnectionFlow, openListenConnection), so they belong in its published POM's
+    // compile scope.
+    api(libs.kotlinx.coroutines)
+    // KSerializer (PGChannel's constructor) and JsonElement (Message.notes) appear in this
+    // module's own public signatures.
+    api(libs.kotlinx.serialization)
+    api(libs.kotlinx.serialization.json)
+
+    // The driver is reached only through java.sql/javax.sql types in the public API; the one
+    // PostgreSQL-specific use (LISTEN/NOTIFY through PGConnection) stays internal.
+    implementation(libs.postgresql)
+
+    testImplementation(libs.hikaricp)
+    testImplementation(libs.kotlin.test.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.postgresql)
+}
+
+mavenPublishing {
+    pom {
+        name = "kcpmq-queues"
+        description = "PostgreSQL-backed message queues for Kotlin coroutines"
+    }
+}

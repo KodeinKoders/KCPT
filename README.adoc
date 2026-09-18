@@ -1,0 +1,11 @@
+= KCPMQ
+:toc: macro
+:toclevels: 2
+:idprefix:
+:idseparator: -
+:source-highlighter: highlight.js
+
+*Message queues on PostgreSQL, driven by Kotlin coroutines — no broker to run.*
+
+KCPMQ turns a PostgreSQL database into a durable message queue.
+Producers post typed payloads, consumers receive them under a lease, and `LISTEN`/`NOTIFY` wakes a waiting consumer the moment a message lands.
