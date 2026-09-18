@@ -104,6 +104,16 @@ internal class MessageQueueImpl<T> internal constructor(
         (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
 ) : MessageQueue<T> {
 
+    // The queue column is VARCHAR(32), so a longer name is accepted here and only fails at the
+    // first post(), as a driver-level "value too long for type character varying(32)" that never
+    // mentions which queue. Checked up front instead, before PGChannel's own 63-byte limit below
+    // can reject a long name with a message about a channel the caller never named.
+    init {
+        require(name.length in 1..MAX_NAME_LENGTH) {
+            "queue name must be 1..$MAX_NAME_LENGTH characters, but '$name' is ${name.length}"
+        }
+    }
+
     private val channel = PGChannel(
         name = "${tables.messages}_$name",
         serializer = Instant.serializer(),
@@ -381,5 +391,10 @@ internal class MessageQueueImpl<T> internal constructor(
                 }
             }
         }
+    }
+
+    private companion object {
+        // The width of the queue column declared in Setup.kt's CREATE TABLE.
+        const val MAX_NAME_LENGTH = 32
     }
 }
