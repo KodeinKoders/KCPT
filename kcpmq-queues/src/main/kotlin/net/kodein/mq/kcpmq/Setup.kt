@@ -35,7 +35,14 @@ internal object Setup {
                             due_at TIMESTAMPTZ NOT NULL,
                             started_at TIMESTAMPTZ DEFAULT NULL,
                             payload JSON NOT NULL,
-                            notes JSON DEFAULT '[]',
+                            -- NOT NULL, not merely defaulted: both selection queries filter on
+                            -- json_array_length(notes) < ?, and json_array_length(NULL) is NULL,
+                            -- so the predicate is neither true nor false and the row is never
+                            -- selected — not for delivery, not for retry, not for dead-lettering.
+                            -- It would sit in the table forever, invisible to every code path and
+                            -- to maxTries. A foreign writer omitting notes from an explicit column
+                            -- list is exactly how that happens, and this library expects those.
+                            notes JSON NOT NULL DEFAULT '[]',
                             PRIMARY KEY(queue, id)
                         )
                     """
