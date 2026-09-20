@@ -209,4 +209,30 @@ class SchemaSetupTest : AbstractPgsqlTest() {
             }
         }
     }
+
+    // setProperty is an upsert, but initializeMQSchema only ever reaches its insert: with a single
+    // migration it writes schema_version exactly once per fresh database, so the ON CONFLICT branch
+    // is unreachable through any public path. Exercised directly here so that whoever adds a second
+    // migration is not the first to find out whether it works.
+    @Test
+    fun setPropertyOverwritesAnExistingValue() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
+
+        val tables = MQTables.named(
+            properties = "${prefix}properties",
+            messages = "${prefix}messages",
+        )
+        val probe = Property("d5_probe", Property.Encoder.StringEncoder)
+
+        dataSource.asSource()().use { connection ->
+            context(tables) {
+                connection.setProperty(probe, "first")
+                assertEquals("first", connection.getProperty(probe))
+
+                connection.setProperty(probe, "second")
+                assertEquals("second", connection.getProperty(probe), "the second write must replace the first")
+            }
+        }
+    }
 }

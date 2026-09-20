@@ -40,11 +40,13 @@ internal suspend fun <T : Any> Connection.getProperty(property: Property<T>): T?
 context(tables: MQTables)
 internal suspend fun <T : Any> Connection.setProperty(property: Property<T>, value: T) = withContext(Dispatchers.IO) {
     val encodedValue = property.encoder.encode(value)
-    prepareStatement("INSERT INTO ${tables.properties} (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = ?")
+    // EXCLUDED.value is the value this statement tried to insert, so the update cannot disagree with
+    // the insert. Binding it a second time said the same thing in a way that two edits could pull
+    // apart.
+    prepareStatement("INSERT INTO ${tables.properties} (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
         .use {
             it.setString(1, property.key)
             it.setString(2, encodedValue)
-            it.setString(3, encodedValue)
             it.execute()
         }
 }
