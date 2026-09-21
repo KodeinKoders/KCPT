@@ -235,4 +235,23 @@ class SchemaSetupTest : AbstractPgsqlTest() {
             }
         }
     }
+
+    // A corrupted or hand-edited schema_version must not read as "not yet migrated" — that treats a
+    // data problem as an ordinary fresh database and re-runs the migration against tables that
+    // already exist, surfacing as "CREATE TABLE ... already exists" rather than naming the actual
+    // cause.
+    @Test
+    fun anUnreadableSchemaVersionFailsInitializationRatherThanReMigrating() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
+
+        dataSource.rawSetProperty(prefix, "schema_version", "not-a-number")
+
+        val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+        val failure = assertFailsWith<IllegalStateException> { sink.initialize() }
+        assertTrue(
+            "not-a-number" in (failure.message ?: ""),
+            "the failure must name the offending value; message was: ${failure.message}",
+        )
+    }
 }

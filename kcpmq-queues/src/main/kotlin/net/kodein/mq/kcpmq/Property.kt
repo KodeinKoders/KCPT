@@ -27,13 +27,20 @@ internal class Property<T : Any>(val key: String, val encoder: Encoder<T>) {
 
 context(tables: MQTables)
 internal suspend fun <T : Any> Connection.getProperty(property: Property<T>): T? = withContext(Dispatchers.IO) {
-    prepareStatement("SELECT value FROM ${tables.properties} WHERE key = ?").use { statement ->
+    val raw = prepareStatement("SELECT value FROM ${tables.properties} WHERE key = ?").use { statement ->
         statement.setString(1, property.key)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.getString("value") else null
         }
-    }?.let {
-        property.encoder.decode(it)
+    } ?: return@withContext null
+
+    // Absent (above) and present-but-unreadable are different problems: the first is an ordinary
+    // fresh database, the second is corruption or a hand-edit, and initializeMQSchema treats a
+    // null the same as "not yet migrated" — collapsing the two would let corrupted state re-run the
+    // migration from scratch against tables that already exist, surfacing as "CREATE TABLE ...
+    // already exists" rather than as the data problem it actually is.
+    checkNotNull(property.encoder.decode(raw)) {
+        "Property '${property.key}' in ${tables.properties} has a value that could not be decoded: '$raw'"
     }
 }
 

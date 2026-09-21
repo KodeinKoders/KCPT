@@ -187,3 +187,16 @@ fun HikariDataSource.explain(sql: String): List<String> =
             }
         }
     }
+
+// Writes a properties row directly, bypassing setProperty's encoder entirely — the way a hand-edit
+// or storage corruption would leave a value the encoder was never asked to produce.
+fun HikariDataSource.rawSetProperty(prefix: String, key: String, value: String) =
+    connection.use { connection ->
+        connection.prepareStatement(
+            "INSERT INTO ${prefix}properties (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+        ).use { statement ->
+            statement.setString(1, key)
+            statement.setString(2, value)
+            statement.executeUpdate()
+        }
+    }
