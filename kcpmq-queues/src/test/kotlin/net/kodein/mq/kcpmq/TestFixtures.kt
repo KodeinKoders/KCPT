@@ -150,3 +150,37 @@ fun HikariDataSource.rawInsertMessage(
         statement.executeUpdate()
     }
 }
+
+// One INSERT … SELECT rather than n round trips: these helpers exist to get a table big enough for
+// the planner to have an opinion, not to exercise the write path.
+fun HikariDataSource.bulkInsertMessages(prefix: String, queue: String, count: Int) =
+    connection.use { connection ->
+        connection.prepareStatement(
+            """
+                INSERT INTO ${prefix}messages (queue, id, due_at, payload, notes)
+                SELECT ?, gen_random_uuid(), now() - (g || ' seconds')::interval,
+                       '{"id":1,"name":"bulk"}'::json, '[]'::json
+                FROM generate_series(1, ?) g
+            """.trimIndent()
+        ).use { statement ->
+            statement.setString(1, queue)
+            statement.setInt(2, count)
+            statement.executeUpdate()
+        }
+    }
+
+// Without statistics the planner has no idea how big the table is, and a sequential scan is a
+// defensible choice whatever indexes exist.
+fun HikariDataSource.analyze(prefix: String) =
+    connection.use { connection ->
+        connection.createStatement().use { it.execute("ANALYZE ${prefix}messages") }
+    }
+
+fun HikariDataSource.explain(sql: String): List<String> =
+    connection.use { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("EXPLAIN $sql").use { resultSet ->
+                generateSequence { if (resultSet.next()) resultSet.getString(1) else null }.toList()
+            }
+        }
+    }

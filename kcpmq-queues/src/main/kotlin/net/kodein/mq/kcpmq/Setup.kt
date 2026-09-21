@@ -42,11 +42,30 @@ internal object Setup {
                 """
             },
             {
+                // Serves the wake-up query's min(due_at) subquery in receiveNext, which asks for
+                // the next message due in the strict future and so carries `started_at IS NULL` on
+                // its own. It cannot serve the selection query below: that one tests
+                // `started_at IS NULL OR started_at < ?`, and PostgreSQL uses a partial index only
+                // where the query's predicate implies the index's, which a disjunction never does.
                 // language="PostgreSQL"
                 """
                     CREATE INDEX
                     ON $messages (queue, due_at)
                     WHERE started_at IS NULL
+                """
+            },
+            {
+                // Serves receiveNextOrNull's selection query — the hot path, run for every single
+                // delivery. queue leads for its equality, due_at takes the range, and id completes
+                // `ORDER BY due_at, id` so the LIMIT 1 stops at the first matching entry instead of
+                // sorting the table. Without this the only other index is partial and unusable
+                // here, and every delivery was a sequential scan followed by a sort. The
+                // started_at disjunction stays a filter — it cannot be indexed as written — but it
+                // is applied to rows already in the required order.
+                // language="PostgreSQL"
+                """
+                    CREATE INDEX
+                    ON $messages (queue, due_at, id)
                 """
             },
         ),
