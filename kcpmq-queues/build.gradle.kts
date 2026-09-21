@@ -46,3 +46,11 @@ mavenPublishing {
         description = "PostgreSQL-backed message queues for Kotlin coroutines"
     }
 }
+
+tasks.test {
+    // Each fork builds its own Testcontainers Postgres in AbstractPgsqlTest's companion object, so
+    // forks share no database and cannot exhaust one another's connections — the cost is one
+    // container per fork, which is why this is half the cores rather than all of them. Tests no
+    // longer clean up after each other, so nothing here depends on running sequentially.
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
+}

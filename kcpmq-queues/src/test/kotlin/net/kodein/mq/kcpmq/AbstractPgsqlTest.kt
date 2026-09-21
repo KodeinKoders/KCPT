@@ -2,7 +2,6 @@ package net.kodein.mq.kcpmq
 
 import com.zaxxer.hikari.HikariDataSource
 import org.testcontainers.postgresql.PostgreSQLContainer
-import java.sql.DriverManager
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.time.Duration
@@ -21,12 +20,12 @@ abstract class AbstractPgsqlTest {
 
     protected lateinit var dataSource: HikariDataSource
 
+    // No cleanup between tests: every test names its tables through uniquePrefix(), so it cannot
+    // see another's. Dropping the schema added nothing to that and coupled the suite to running
+    // sequentially — with tests in parallel it would have deleted tables out from under a test
+    // still using them, and the failures would have read as product bugs.
     @BeforeTest
     fun setup() {
-        DriverManager.getConnection(pgContainer.jdbcUrl, pgContainer.username, pgContainer.password).use { connection ->
-            connection.createStatement().use { it.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;") }
-        }
-
         dataSource = HikariDataSource().apply {
             jdbcUrl = pgContainer.jdbcUrl
             username = pgContainer.username
