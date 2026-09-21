@@ -53,4 +53,38 @@ class QueryPlanTest : AbstractPgsqlTest() {
             "the selection query must not scan the whole table; plan was:\n$rendered",
         )
     }
+
+    @Test
+    fun theWakeUpQueryHasStartedSecondSubqueryIsServedByAnIndexRatherThanAScan() = runTest(timeout = 30.seconds) {
+        val prefix = uniquePrefix()
+        val queue = uniqueQueueName()
+        MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
+
+        dataSource.bulkInsertMessages(prefix, queue, rows, started = true)
+        dataSource.analyze(prefix)
+
+        // The wake-up query's other subquery, min(due_at) WHERE started_at IS NULL, is already
+        // served by the partial index built for it. Kept in step with MessageQueue.kt by hand, as
+        // the selection query above is.
+        val plan = dataSource.explain(
+            """
+                SELECT min(started_at)
+                FROM ${prefix}messages
+                WHERE
+                        queue = '$queue'
+                    AND started_at IS NOT NULL
+                    AND started_at > now() - interval '1 hour'
+            """.trimIndent()
+        )
+
+        val rendered = plan.joinToString("\n")
+        assertTrue(
+            plan.any { "Index Scan" in it || "Index Only Scan" in it },
+            "the wake-up query's started_at subquery must be served by an index; plan was:\n$rendered",
+        )
+        assertTrue(
+            plan.none { "Seq Scan" in it },
+            "the wake-up query's started_at subquery must not scan the whole table; plan was:\n$rendered",
+        )
+    }
 }

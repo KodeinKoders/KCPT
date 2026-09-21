@@ -152,19 +152,22 @@ fun HikariDataSource.rawInsertMessage(
 }
 
 // One INSERT … SELECT rather than n round trips: these helpers exist to get a table big enough for
-// the planner to have an opinion, not to exercise the write path.
-fun HikariDataSource.bulkInsertMessages(prefix: String, queue: String, count: Int) =
+// the planner to have an opinion, not to exercise the write path. started marks every row leased
+// (started_at set, in the past) rather than pending, for tests about the leased side of a query.
+fun HikariDataSource.bulkInsertMessages(prefix: String, queue: String, count: Int, started: Boolean = false) =
     connection.use { connection ->
         connection.prepareStatement(
             """
-                INSERT INTO ${prefix}messages (queue, id, due_at, payload, notes)
+                INSERT INTO ${prefix}messages (queue, id, due_at, started_at, payload, notes)
                 SELECT ?, gen_random_uuid(), now() - (g || ' seconds')::interval,
+                       CASE WHEN ? THEN now() - (g || ' seconds')::interval ELSE NULL END,
                        '{"id":1,"name":"bulk"}'::json, '[]'::json
                 FROM generate_series(1, ?) g
             """.trimIndent()
         ).use { statement ->
             statement.setString(1, queue)
-            statement.setInt(2, count)
+            statement.setBoolean(2, started)
+            statement.setInt(3, count)
             statement.executeUpdate()
         }
     }

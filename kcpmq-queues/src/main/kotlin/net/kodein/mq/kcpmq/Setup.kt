@@ -68,6 +68,20 @@ internal object Setup {
                     ON $messages (queue, due_at, id)
                 """
             },
+            {
+                // Serves the wake-up query's other subquery: min(started_at) WHERE queue = ? AND
+                // started_at IS NOT NULL AND started_at > ?, run whenever the queue is not empty of
+                // in-flight messages. Unlike the partial index above, the query's own
+                // `started_at > ?` already implies `started_at IS NOT NULL` — a NULL comparison is
+                // never true — so the partial predicate here matches what the planner can prove,
+                // where the disjunction in the selection query could not.
+                // language="PostgreSQL"
+                """
+                    CREATE INDEX
+                    ON $messages (queue, started_at)
+                    WHERE started_at IS NOT NULL
+                """
+            },
         ),
     )
 
