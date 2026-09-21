@@ -170,7 +170,7 @@ public sealed class MessageProcessingFailure {
                 "timeoutMs" to JsonPrimitive(timeout.inWholeMilliseconds),
             )
     }
-    public data class Cancellation(val cancelledFromWork: Boolean) : MessageProcessingFailure() {
+    public data class Cancellation(public val cancelledFromWork: Boolean) : MessageProcessingFailure() {
         override fun defaultNotes(): Map<String, JsonElement> =
             mapOf(
                 "cause" to JsonPrimitive("cancellation"),
