@@ -201,7 +201,6 @@ public suspend fun <T> Message<T>.process(
                 val notes = process(this@process)
                 successDelete(notes ?: JsonNull)
                 keepAliveJob?.cancelAndJoin()
-                true
             }
         } catch (_: TimeoutCancellationException) {
             withContext(NonCancellable) {
