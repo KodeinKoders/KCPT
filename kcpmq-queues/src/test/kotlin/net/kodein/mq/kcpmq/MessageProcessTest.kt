@@ -241,6 +241,60 @@ class MessageProcessTest : AbstractPgsqlTest() {
         }
     }
 
+    // failureRequeue itself can throw (a dropped connection, an exhausted pool). Unguarded, that
+    // exception used to leave process() from inside this very catch block.
+    @Test
+    fun processDoesNotThrowWhenTheRequeueFails() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val mq = MessageQueueSink(source = dataSource.asFailureRequeueFailingOnceSource(), tablesPrefix = prefix)
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(maxTries = 5))
+            mq.post(User(1, "A"))
+            val message = mq.tryReceive()!!
+
+            val reported = mutableListOf<Pair<MessageProcessingFailure, Throwable>>()
+            message.process(onRequeueFailure = { _, failure, cause -> reported += failure to cause }) {
+                throw RuntimeException("boom")
+            }
+
+            assertEquals(1, reported.size, "the failed requeue must be reported exactly once")
+            assertTrue(reported[0].first is MessageProcessingFailure.Exception, "the original failure must still be reported")
+            assertTrue(reported[0].second is java.sql.SQLException, "the requeue's own failure must be reported as the cause")
+        }
+    }
+
+    // The regression this guards: containing the requeue's failure must not also contain the
+    // caller's own cancellation. ensureActive() runs after the guard, not inside it.
+    @Test
+    fun callerCancellationStillPropagatesWhenTheRequeueFails() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val mq = MessageQueueSink(source = dataSource.asFailureRequeueFailingOnceSource(), tablesPrefix = prefix)
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(maxTries = 5))
+            mq.post(User(1, "A"))
+            val message = mq.tryReceive()!!
+
+            val reachedCodeAfterProcess = AtomicBoolean(false)
+            var reportedCause: Throwable? = null
+            val job = launch {
+                message.process(
+                    timeout = 10.seconds,
+                    onRequeueFailure = { _, _, cause -> reportedCause = cause },
+                ) { delay(10.seconds); null }
+                reachedCodeAfterProcess.set(true)
+            }
+            delay(300.milliseconds)
+            job.cancelAndJoin()
+
+            assertFalse(
+                reachedCodeAfterProcess.get(),
+                "cancellation of the calling coroutine must propagate out of process() even when the requeue fails",
+            )
+            assertTrue(job.isCancelled)
+            assertNotNull(reportedCause, "the failed requeue must still be reported")
+        }
+    }
+
     @Test
     fun processRecordsWhetherTheCancellationCameFromTheParentOrTheWork() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {

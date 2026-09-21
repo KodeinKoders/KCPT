@@ -153,6 +153,57 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
+    // The blast radius of a requeue that fails: failureRequeue talks to the database like any other
+    // acknowledgement, so it can throw on a dropped connection. Unguarded, that exception would
+    // cancel the pool's scope and take every other in-flight message down with it.
+    @Test
+    fun workerPoolSurvivesARequeueThatFails() = runTest(timeout = 10.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asFailureRequeueFailingOnceSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
+            q.post(User(1, "throws"))
+            q.post(User(2, "ok-a"))
+            q.post(User(3, "ok-b"))
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val reported = ConcurrentLinkedQueue<kotlin.uuid.Uuid>()
+            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
+            var poisonedId: kotlin.uuid.Uuid? = null
+            val poolJob = launch {
+                q.workerPool(
+                    numberOfWorkers = 1,
+                    onRequeueFailure = { message, _, _ -> reported += message.id },
+                ) { message ->
+                    if (message.payload.name == "throws") {
+                        poisonedId = message.id
+                        attempts.incrementAndGet()
+                        throw RuntimeException("boom")
+                    }
+                    processed += message.payload.id
+                    null
+                }
+            }
+
+            withTimeoutOrNullAssert(5.seconds, "workerPool must keep running after a requeue fails") {
+                awaitUntil { processed.containsAll(listOf(2, 3)) }
+            }
+            assertTrue(poolJob.isActive, "the pool must survive a requeue that fails")
+            assertEquals(1, reported.size, "the failed requeue must be reported exactly once")
+            assertEquals(poisonedId, reported.firstOrNull())
+            assertNotNull(
+                dataSource.startedAtOf(prefix, poisonedId!!),
+                "the lease must stand: the UPDATE that would have cleared started_at is the one that failed",
+            )
+
+            withTimeoutOrNullAssert(8.seconds, "the message must eventually be redelivered once its lease expires") {
+                awaitUntil { attempts.get() >= 2 }
+            }
+            poolJob.cancelAndJoin()
+        }
+    }
+
     @Test
     fun workerPoolRequeuesAMessageThatExceedsWorkTimeout() = runTest(timeout = 10.seconds) {
         withContext(Dispatchers.Default) {

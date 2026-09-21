@@ -5,8 +5,12 @@ package net.kodein.mq.kcpmq
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
+import java.lang.reflect.Proxy
+import java.sql.Connection
+import java.sql.SQLException
 import java.time.OffsetDateTime
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Instant
 import kotlin.uuid.Uuid
 import kotlin.uuid.toJavaUuid
@@ -67,6 +71,31 @@ class RecordingUndecodableNotifications {
 
     val handler: (String, String, Throwable) -> Unit = { channel, payload, cause ->
         recorded += Recorded(channel, payload, cause)
+    }
+}
+
+// Wraps a real connection so the first attempt to run failureRequeue's own UPDATE throws instead of
+// executing, then lets everything else through untouched — the shape of a dropped connection or an
+// exhausted pool during acknowledgement. Matched by "started_at = NULL", the text unique to that
+// statement (recordUndecodable's UPDATE shares it too, but nothing using this fixture goes near an
+// undecodable payload). Fires once, via compareAndSet, so the rest of a test's traffic is unaffected.
+fun HikariDataSource.asFailureRequeueFailingOnceSource(): Source {
+    val real = asSource()
+    val failed = AtomicBoolean(false)
+    return {
+        val connection = real()
+        Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf(Connection::class.java),
+        ) { _, method, args ->
+            if (method.name == "prepareStatement" &&
+                (args?.getOrNull(0) as? String)?.contains("started_at = NULL") == true &&
+                failed.compareAndSet(false, true)
+            ) {
+                throw SQLException("connection blip")
+            }
+            if (args == null) method.invoke(connection) else method.invoke(connection, *args)
+        } as Connection
     }
 }
 

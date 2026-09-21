@@ -190,9 +190,39 @@ public suspend fun <T> Message<T>.process(
     timeout: Duration = this.expiresAt - Clock.System.now(),
     keepalive: Duration? = null,
     onFailure: (failure: MessageProcessingFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
+    onRequeueFailure: (message: Message<T>, failure: MessageProcessingFailure, cause: Throwable) -> Unit = { _, _, _ -> },
     process: suspend (Message<T>) -> JsonElement?
 ) {
     require(keepalive == null || keepalive < timeout) { "Keepalive must be less than message processing timeout" }
+
+    // failureRequeue talks to the database, so a dropped connection or an exhausted pool makes it
+    // throw. Left unguarded, that exception would leave process() from inside a catch block,
+    // escape workerPool's launch, and cancel the pool's scope — one message's transient blip
+    // killing every other message in flight.
+    //
+    // Nothing is lost by containing it here: the UPDATE that would have cleared started_at is the
+    // one that failed, so the lease stands and the row stays invisible to other consumers until it
+    // expires; receiveNextOrNull then reclaims it, appends leaseExpiredNote and counts the try,
+    // exactly as this requeue would have. The only cost is that redelivery waits for
+    // processingTimeout + processingGrace instead of happening now.
+    //
+    // The caller hears about it through onRequeueFailure and nowhere else: there is no logging in
+    // this library, and failureRequeue deliberately notifies no observer. onRequeueFailure is
+    // itself caller-supplied code on a failure path, so it is guarded in turn — a throw from it
+    // would reopen this very hole.
+    //
+    // Catches Throwable flat, CancellationException included: this runs under NonCancellable, so
+    // the caller's own cancellation cannot arrive here as an exception — it is re-raised from the
+    // scope's Job by the ensureActive() below, outside this guard. Anything caught here is the
+    // requeue's own failure.
+    suspend fun requeue(failure: MessageProcessingFailure): Unit = withContext(NonCancellable) {
+        try {
+            failureRequeue(notes = onFailure(failure))
+        } catch (cause: Throwable) {
+            try { onRequeueFailure(this@process, failure, cause) } catch (_: Throwable) {}
+        }
+    }
+
     coroutineScope {
         try {
             withTimeout(timeout) {
@@ -210,21 +240,15 @@ public suspend fun <T> Message<T>.process(
                 keepAliveJob?.cancelAndJoin()
             }
         } catch (_: TimeoutCancellationException) {
-            withContext(NonCancellable) {
-                failureRequeue(notes = onFailure(MessageProcessingFailure.Timeout(timeout)))
-            }
+            requeue(MessageProcessingFailure.Timeout(timeout))
         } catch (_: CancellationException) {
             // Read before entering NonCancellable: NonCancellable is an always-active Job that
             // would shadow this scope's Job and make isActive always report true.
             val cancelledFromWork = isActive
-            withContext(NonCancellable) {
-                failureRequeue(notes = onFailure(MessageProcessingFailure.Cancellation(cancelledFromWork)))
-            }
+            requeue(MessageProcessingFailure.Cancellation(cancelledFromWork))
             ensureActive()
         } catch (t: Throwable) {
-            withContext(NonCancellable) {
-                failureRequeue(notes = onFailure(MessageProcessingFailure.Exception(t)))
-            }
+            requeue(MessageProcessingFailure.Exception(t))
         }
     }
 }
