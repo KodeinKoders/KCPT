@@ -5,16 +5,10 @@ package net.kodein.mq.kcpmq
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.sql.Connection
-import java.sql.PreparedStatement
 import kotlin.use
 
 
 internal object Setup {
-    private class MigrationStatement(
-        val sql: MQTables.() -> String,
-        val conf: MQTables.(PreparedStatement) -> Unit = {}
-    )
-
     context(tables: MQTables)
     private suspend fun initializePropertiesTable(connection: Connection) = withContext(Dispatchers.IO) {
         connection.prepareStatement("CREATE TABLE IF NOT EXISTS ${tables.properties} (key VARCHAR(32) PRIMARY KEY, value TEXT)").use {
@@ -22,44 +16,42 @@ internal object Setup {
         }
     }
 
-    private val mqMigrations: List<List<MigrationStatement>> = listOf(
+    // One list per version step, each entry rendering one statement from the table names.
+    private val mqMigrations: List<List<MQTables.() -> String>> = listOf(
         // 0 -> 1
         listOf(
-            MigrationStatement(
-                sql = {
-                    // language="PostgreSQL"
-                    """
-                        CREATE TABLE $messages (
-                            queue VARCHAR(32) NOT NULL,
-                            id UUID NOT NULL,
-                            due_at TIMESTAMPTZ NOT NULL,
-                            started_at TIMESTAMPTZ DEFAULT NULL,
-                            payload JSON NOT NULL,
-                            -- NOT NULL, not merely defaulted: both selection queries filter on
-                            -- json_array_length(notes) < ?, and json_array_length(NULL) is NULL,
-                            -- so the predicate is neither true nor false and the row is never
-                            -- selected — not for delivery, not for retry, not for dead-lettering.
-                            -- It would sit in the table forever, invisible to every code path and
-                            -- to maxTries. A foreign writer omitting notes from an explicit column
-                            -- list is exactly how that happens, and this library expects those.
-                            notes JSON NOT NULL DEFAULT '[]',
-                            PRIMARY KEY(queue, id)
-                        )
-                    """
-                },
-            ),
-            MigrationStatement(
-                sql =  {
-                    // language="PostgreSQL"
-                    """
-                        CREATE INDEX
-                        ON $messages (queue, due_at)
-                        WHERE started_at IS NULL
-                    """
-                },
-            )
-        )
+            {
+                // language="PostgreSQL"
+                """
+                    CREATE TABLE $messages (
+                        queue VARCHAR(32) NOT NULL,
+                        id UUID NOT NULL,
+                        due_at TIMESTAMPTZ NOT NULL,
+                        started_at TIMESTAMPTZ DEFAULT NULL,
+                        payload JSON NOT NULL,
+                        -- NOT NULL, not merely defaulted: both selection queries filter on
+                        -- json_array_length(notes) < ?, and json_array_length(NULL) is NULL,
+                        -- so the predicate is neither true nor false and the row is never
+                        -- selected — not for delivery, not for retry, not for dead-lettering.
+                        -- It would sit in the table forever, invisible to every code path and
+                        -- to maxTries. A foreign writer omitting notes from an explicit column
+                        -- list is exactly how that happens, and this library expects those.
+                        notes JSON NOT NULL DEFAULT '[]',
+                        PRIMARY KEY(queue, id)
+                    )
+                """
+            },
+            {
+                // language="PostgreSQL"
+                """
+                    CREATE INDEX
+                    ON $messages (queue, due_at)
+                    WHERE started_at IS NULL
+                """
+            },
+        ),
     )
+
 
     // A database-wide key, so every process initialising the same tables contends on the same
     // lock. String.hashCode is specified by the JDK, so separate JVMs derive the same value.
@@ -98,11 +90,8 @@ internal object Setup {
                 }
 
                 while (currentVersion < targetVersion) {
-                    mqMigrations[currentVersion].forEach { statement ->
-                        prepareStatement(statement.sql(tables).trimIndent()).use {
-                            statement.conf(tables, it)
-                            it.execute()
-                        }
+                    mqMigrations[currentVersion].forEach { sql ->
+                        prepareStatement(sql(tables).trimIndent()).use { it.execute() }
                     }
                     ++currentVersion
                     setProperty(Property.SchemaVersion, currentVersion)
