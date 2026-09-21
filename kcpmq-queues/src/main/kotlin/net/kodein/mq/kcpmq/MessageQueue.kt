@@ -3,7 +3,9 @@
 package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.consume
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.produceIn
@@ -23,6 +25,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Instant
+import kotlin.use
 import kotlin.uuid.Uuid
 import kotlin.uuid.toJavaUuid
 import kotlin.uuid.toKotlinUuid
@@ -35,6 +38,11 @@ public interface MessageQueue<T> {
     public suspend fun post(value: T, due: Instant? = null)
     public suspend fun tryReceive(): Message<T>?
     public suspend fun receive(): Message<T>
+
+    public interface Receiver<T> : AutoCloseable {
+        public suspend fun receiveNext(): Message<T>
+    }
+    public fun receiver(scope: CoroutineScope): Receiver<T>
 
     public data class Config(
         val maxTries: Int = 5,
@@ -315,26 +323,27 @@ internal class MessageQueueImpl<T> internal constructor(
 
     override suspend fun receive(): Message<T> =
         coroutineScope {
-            receiveNext()
+            receiver(this).use {
+                it.receiveNext()
+            }
         }
 
-    // One pass of receiveNext's database work either takes a message or works out when the next one can become
-    // available. Both outcomes leave the Dispatchers.IO block as a value because withContext's lambda is not
-    // inline: the early return this code used to do from the middle of the block cannot cross it.
-    private sealed interface ReceiveAttempt<T> {
-        class Took<T>(val message: Message<T>) : ReceiveAttempt<T>
-        class WaitUntil<T>(val instant: Instant) : ReceiveAttempt<T>
-    }
+    private inner class ReceiverImpl(
+        private val scope: CoroutineScope,
+    ) : MessageQueue.Receiver<T> {
 
-    private suspend fun CoroutineScope.receiveNext(): Message<T> {
-        source.openListenConnection(this, channel).use { flow ->
+        private val flowDef: Deferred<PGChannel.ConnectionFlow<Instant>> = scope.async {
+            source.openListenConnection(scope, channel)
+        }
+
+        override suspend fun receiveNext(): Message<T> {
             // One subscription for the whole call, not one per wait. The notifications are shared through a
             // SharedFlow with no replay, which drops whatever it emits while nothing is collecting — so a
             // wait loop that resubscribes per notification is deaf for the whole of each database round trip
             // between them, and a message posted in that window was discoverable only by the security timer,
             // minutes later. Holding one subscription across the call buffers what arrives while the database
             // work below is in flight.
-            val notifications = flow.produceIn(this)
+            val notifications = flowDef.await().produceIn(scope)
             notifications.consume {
                 while (true) {
                     // Every statement below blocks the thread it runs on, and receive() is the hot path of every
@@ -356,25 +365,25 @@ internal class MessageQueueImpl<T> internal constructor(
                             // immediately restart because of the notification in the channel.
                             val next = connection.prepareStatement(
                                 """
-                                    SELECT LEAST(
-                                        (
-                                            SELECT min(due_at)
-                                            FROM ${tables.messages}
-                                            WHERE
-                                                    queue = ?
-                                                AND started_at IS NULL
-                                                AND due_at > ?
-                                        ),
-                                        (
-                                            SELECT min(started_at)
-                                            FROM ${tables.messages}
-                                            WHERE
-                                                    queue = ?
-                                                AND started_at IS NOT NULL
-                                                AND started_at > ?
-                                        ) + ?::interval
-                                    )
-                                    """.trimIndent()
+                                SELECT LEAST(
+                                    (
+                                        SELECT min(due_at)
+                                        FROM ${tables.messages}
+                                        WHERE
+                                                queue = ?
+                                            AND started_at IS NULL
+                                            AND due_at > ?
+                                    ),
+                                    (
+                                        SELECT min(started_at)
+                                        FROM ${tables.messages}
+                                        WHERE
+                                                queue = ?
+                                            AND started_at IS NOT NULL
+                                            AND started_at > ?
+                                    ) + ?::interval
+                                )
+                                """.trimIndent()
                             ).use { statement ->
                                 statement.setString(1, name)
                                 statement.setInstant(2, now)
@@ -408,6 +417,27 @@ internal class MessageQueueImpl<T> internal constructor(
                 }
             }
         }
+
+        override fun close() {
+            // getCompleted() throws the deferred's own exception if it failed or was cancelled
+            // before ever producing a ConnectionFlow — nothing was opened in that case, so there is
+            // nothing to close beyond the cancel below. Checked rather than caught: a close() that
+            // can throw is easy to get wrong at every call site that does not expect it to.
+            if (flowDef.isCompleted && flowDef.getCompletionExceptionOrNull() == null) {
+                flowDef.getCompleted().close()
+            }
+            flowDef.cancel()
+        }
+    }
+
+    override fun receiver(scope: CoroutineScope): MessageQueue.Receiver<T> = ReceiverImpl(scope)
+
+    // One pass of receiveNext's database work either takes a message or works out when the next one can become
+    // available. Both outcomes leave the Dispatchers.IO block as a value because withContext's lambda is not
+    // inline: the early return this code used to do from the middle of the block cannot cross it.
+    private sealed interface ReceiveAttempt<T> {
+        class Took<T>(val message: Message<T>) : ReceiveAttempt<T>
+        class WaitUntil<T>(val instant: Instant) : ReceiveAttempt<T>
     }
 
     private companion object {

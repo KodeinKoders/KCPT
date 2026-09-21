@@ -23,24 +23,26 @@ public suspend fun <T> MessageQueue<T>.workerPool(
     newFixedThreadPoolContext(numberOfThreads, "KCPMQ-WorkerPool").use { dispatcher ->
         val semaphore = Semaphore(numberOfWorkers)
         coroutineScope {
-            while (true) {
-                semaphore.acquire()
-                val message =
-                    try { receive() }
-                    catch (e: Throwable) {
-                        semaphore.release()
-                        throw e
-                    }
-                launch(dispatcher) {
-                    try {
-                        message.process(
-                            timeout = timeout,
-                            keepalive = keepalive,
-                            onRequeueFailure = onRequeueFailure,
-                            process = process
-                        )
-                    } finally {
-                        semaphore.release()
+            receiver(this).use { receiver ->
+                while (true) {
+                    semaphore.acquire()
+                    val message =
+                        try { receiver.receiveNext() }
+                        catch (e: Throwable) {
+                            semaphore.release()
+                            throw e
+                        }
+                    launch(dispatcher) {
+                        try {
+                            message.process(
+                                timeout = timeout,
+                                keepalive = keepalive,
+                                onRequeueFailure = onRequeueFailure,
+                                process = process
+                            )
+                        } finally {
+                            semaphore.release()
+                        }
                     }
                 }
             }

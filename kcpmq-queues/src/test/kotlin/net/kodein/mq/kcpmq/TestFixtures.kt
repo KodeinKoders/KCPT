@@ -11,6 +11,7 @@ import java.sql.SQLException
 import java.time.OffsetDateTime
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Instant
 import kotlin.uuid.Uuid
 import kotlin.uuid.toJavaUuid
@@ -92,6 +93,45 @@ fun HikariDataSource.asFailureRequeueFailingOnceSource(): Source {
                 (args?.getOrNull(0) as? String)?.contains("started_at = NULL") == true &&
                 failed.compareAndSet(false, true)
             ) {
+                throw SQLException("connection blip")
+            }
+            if (args == null) method.invoke(connection) else method.invoke(connection, *args)
+        } as Connection
+    }
+}
+
+// Wraps a real connection so every LISTEN it executes is counted — openListenConnection issues
+// exactly one per connection it opens, so counting it is what proves whether a listening
+// connection is being reused across many receiveNext() calls or reopened per one.
+fun HikariDataSource.countingListenSource(listens: AtomicInteger): Source {
+    val real = asSource()
+    return {
+        val connection = real()
+        Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf(Connection::class.java),
+        ) { _, method, args ->
+            if (method.name == "prepareStatement" && (args?.getOrNull(0) as? String)?.startsWith("LISTEN ") == true) {
+                listens.incrementAndGet()
+            }
+            if (args == null) method.invoke(connection) else method.invoke(connection, *args)
+        } as Connection
+    }
+}
+
+// Wraps a real connection so LISTEN — the statement openListenConnection issues right after
+// acquiring a connection — throws instead of executing, the shape of a dropped connection or an
+// exhausted pool during that handshake. Everything else (post, tryReceive, schema setup) goes
+// through untouched, since none of it ever issues LISTEN.
+fun HikariDataSource.asListenFailingSource(): Source {
+    val real = asSource()
+    return {
+        val connection = real()
+        Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf(Connection::class.java),
+        ) { _, method, args ->
+            if (method.name == "prepareStatement" && (args?.getOrNull(0) as? String)?.startsWith("LISTEN ") == true) {
                 throw SQLException("connection blip")
             }
             if (args == null) method.invoke(connection) else method.invoke(connection, *args)

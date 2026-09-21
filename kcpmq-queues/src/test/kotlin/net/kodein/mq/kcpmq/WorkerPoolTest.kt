@@ -153,6 +153,36 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
+    // The actual point of holding a Receiver for the pool's whole lifetime rather than calling
+    // receive() per iteration: one LISTEN for however many messages the pool processes, not one
+    // per message. Regresses to one-per-message if workerPool's loop ever goes back to calling
+    // receive() instead of the receiver it holds open.
+    @Test
+    fun workerPoolHoldsOneListenConnectionForItsWholeLifetime() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val listens = java.util.concurrent.atomic.AtomicInteger(0)
+            val q = MessageQueueSink(source = dataSource.countingListenSource(listens), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer())
+            (0..9).forEach { q.post(User(it, "u$it")) }
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1) { message -> processed += message.payload.id; null }
+            }
+            withTimeoutOrNullAssert(5.seconds, "workerPool must process every posted message") {
+                awaitUntil { processed.size == 10 }
+            }
+            poolJob.cancelAndJoin()
+
+            assertEquals(
+                1, listens.get(),
+                "workerPool must hold one listening connection for its whole lifetime, not reopen one per message",
+            )
+        }
+    }
+
     // The blast radius of a requeue that fails: failureRequeue talks to the database like any other
     // acknowledgement, so it can throw on a dropped connection. Unguarded, that exception would
     // cancel the pool's scope and take every other in-flight message down with it.
