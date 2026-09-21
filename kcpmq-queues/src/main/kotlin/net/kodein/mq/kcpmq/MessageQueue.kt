@@ -217,9 +217,10 @@ internal class MessageQueueImpl<T> internal constructor(
                 }
 
                 if (candidate.startedAt == null) {
-                    prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
+                    prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE queue = ? AND id = ?").use { statement ->
                         statement.setInstant(1, now)
-                        statement.setObject(2, candidate.id.toJavaUuid())
+                        statement.setString(2, name)
+                        statement.setObject(3, candidate.id.toJavaUuid())
                         statement.executeUpdate()
                     }
                     return message(candidate.id, candidate.payload, candidate.notes, now)
@@ -229,18 +230,20 @@ internal class MessageQueueImpl<T> internal constructor(
                 // failed try, exactly as an explicit failureRequeue would.
                 val notes = JsonArray(candidate.notes + leaseExpiredNote)
                 if (notes.size >= config.maxTries) {
-                    prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
-                        statement.setObject(1, candidate.id.toJavaUuid())
+                    prepareStatement("DELETE FROM ${tables.messages} WHERE queue = ? AND id = ?").use { statement ->
+                        statement.setString(1, name)
+                        statement.setObject(2, candidate.id.toJavaUuid())
                         statement.executeUpdate()
                     }
                     commit()
                     messageObservers.notifyEach { it.onFailure(candidate.id, candidate.payload, leaseExpiredNote) }
                     continue
                 }
-                prepareStatement("UPDATE ${tables.messages} SET started_at = ?, notes = ?::json WHERE id = ?").use { statement ->
+                prepareStatement("UPDATE ${tables.messages} SET started_at = ?, notes = ?::json WHERE queue = ? AND id = ?").use { statement ->
                     statement.setInstant(1, now)
                     statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
-                    statement.setObject(3, candidate.id.toJavaUuid())
+                    statement.setString(3, name)
+                    statement.setObject(4, candidate.id.toJavaUuid())
                     statement.executeUpdate()
                 }
                 return message(candidate.id, candidate.payload, notes, now)
@@ -271,8 +274,9 @@ internal class MessageQueueImpl<T> internal constructor(
         val notes = JsonArray(previousNotes + undecodableNote)
 
         if (notes.size >= config.maxTries) {
-            prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
-                statement.setObject(1, raw.id.toJavaUuid())
+            prepareStatement("DELETE FROM ${tables.messages} WHERE queue = ? AND id = ?").use { statement ->
+                statement.setString(1, name)
+                statement.setObject(2, raw.id.toJavaUuid())
                 statement.executeUpdate()
             }
             commit()
@@ -281,10 +285,11 @@ internal class MessageQueueImpl<T> internal constructor(
         }
 
         val dueAt = now + config.processingTimeout
-        prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
+        prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE queue = ? AND id = ?").use { statement ->
             statement.setInstant(1, dueAt)
             statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), notes))
-            statement.setObject(3, raw.id.toJavaUuid())
+            statement.setString(3, name)
+            statement.setObject(4, raw.id.toJavaUuid())
             statement.executeUpdate()
         }
         // Announced before the commit that delivers it, like every other write that makes a
@@ -303,6 +308,7 @@ internal class MessageQueueImpl<T> internal constructor(
             notes = notes,
             source = source,
             tables = tables,
+            queue = name,
             channel = channel,
             observers = messageObservers,
         )

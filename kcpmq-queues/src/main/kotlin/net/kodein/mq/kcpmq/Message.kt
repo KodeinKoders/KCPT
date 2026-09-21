@@ -73,6 +73,9 @@ internal class MessageImpl<T>(
     override val notes: List<JsonElement>,
     private val source: Source,
     private val tables: MQTables,
+    // Carried only so every statement below can filter on it alongside id: the primary key is
+    // (queue, id), and a statement matching id alone cannot use that index as a direct lookup.
+    private val queue: String,
     // Requeuing makes this message available again, which a consumer already parked in receive()
     // has no other way of learning — so it is announced on the same channel post() uses.
     private val channel: PGChannel<Instant>,
@@ -95,8 +98,9 @@ internal class MessageImpl<T>(
     // shared timer thread, where it would hold up every delay() in the process.
     override suspend fun successDelete(notes: JsonElement): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
-            connection.prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
-                statement.setObject(1, id.toJavaUuid())
+            connection.prepareStatement("DELETE FROM ${tables.messages} WHERE queue = ? AND id = ?").use { statement ->
+                statement.setString(1, queue)
+                statement.setObject(2, id.toJavaUuid())
                 statement.executeUpdate()
             }
         }
@@ -117,10 +121,11 @@ internal class MessageImpl<T>(
             // arrived before its row was visible would wake a consumer, show it nothing, and send
             // it back to sleep on a later deadline — worse than never notifying at all.
             connection.transaction {
-                prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE id = ?").use { statement ->
+                prepareStatement("UPDATE ${tables.messages} SET due_at = ?, notes = ?::json, started_at = NULL WHERE queue = ? AND id = ?").use { statement ->
                     statement.setInstant(1, dueAt)
                     statement.setString(2, mqJson.encodeToString(JsonArray.serializer(), updatedNotes))
-                    statement.setObject(3, id.toJavaUuid())
+                    statement.setString(3, queue)
+                    statement.setObject(4, id.toJavaUuid())
                     statement.executeUpdate()
                 }
                 notify(channel, dueAt)
@@ -130,8 +135,9 @@ internal class MessageImpl<T>(
 
     override suspend fun failureDelete(notes: JsonElement): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
-            connection.prepareStatement("DELETE FROM ${tables.messages} WHERE id = ?").use { statement ->
-                statement.setObject(1, id.toJavaUuid())
+            connection.prepareStatement("DELETE FROM ${tables.messages} WHERE queue = ? AND id = ?").use { statement ->
+                statement.setString(1, queue)
+                statement.setObject(2, id.toJavaUuid())
                 statement.executeUpdate()
             }
         }
@@ -141,9 +147,10 @@ internal class MessageImpl<T>(
     override suspend fun extend(): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
             val now = Clock.System.now()
-            connection.prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE id = ?").use { statement ->
+            connection.prepareStatement("UPDATE ${tables.messages} SET started_at = ? WHERE queue = ? AND id = ?").use { statement ->
                 statement.setInstant(1, now)
-                statement.setObject(2, id.toJavaUuid())
+                statement.setString(2, queue)
+                statement.setObject(3, id.toJavaUuid())
                 statement.executeUpdate()
             }
             expiresAt = now + mqConfig.processingTimeout

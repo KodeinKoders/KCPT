@@ -87,4 +87,45 @@ class QueryPlanTest : AbstractPgsqlTest() {
             "the wake-up query's started_at subquery must not scan the whole table; plan was:\n$rendered",
         )
     }
+
+    // Every per-message statement (successDelete, extend, the dead-letter deletes, ...) matches
+    // queue = ? AND id = ?, and the primary key is (queue, id) — kept in step with Message.kt's
+    // successDelete by hand, which all the others share the shape of. The id-only alternative is
+    // not what production runs any more; it is planned only for comparison, to show the shape of
+    // the regression this guards against. On PostgreSQL 18 the planner can cover an id-only match
+    // with a skip scan, but that is new in this release and this project pins no minimum server
+    // version — on 17 and earlier the same statement is a sequential scan.
+    @Test
+    fun successDeletesStatementIsAPrimaryKeyLookupRatherThanAnIdOnlyMatch() = runTest(timeout = 30.seconds) {
+        val prefix = uniquePrefix()
+        val queue = uniqueQueueName()
+        MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
+
+        dataSource.bulkInsertMessages(prefix, queue, rows)
+        dataSource.analyze(prefix)
+        val id = kotlin.uuid.Uuid.random()
+
+        val queueAndId = dataSource.explain(
+            "DELETE FROM ${prefix}messages WHERE queue = '$queue' AND id = '$id'"
+        ).joinToString("\n")
+        val idOnly = dataSource.explain(
+            "DELETE FROM ${prefix}messages WHERE id = '$id'"
+        ).joinToString("\n")
+
+        assertTrue(
+            ("Index Scan" in queueAndId || "Index Only Scan" in queueAndId) && "Seq Scan" !in queueAndId,
+            "successDelete's statement must be a direct index lookup; plan was:\n$queueAndId",
+        )
+
+        // cost=startup..total — startup is identical for both (the index root descent), so it is
+        // the total that has to be compared.
+        fun totalCost(plan: String) = plan.lineSequence().first()
+            .substringAfter("..").substringBefore(" ").toDouble()
+
+        assertTrue(
+            totalCost(queueAndId) < totalCost(idOnly),
+            "matching queue alongside id must be cheaper than id alone; " +
+                "queue+id plan was:\n$queueAndId\n\nid-only plan was:\n$idOnly",
+        )
+    }
 }
