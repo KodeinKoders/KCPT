@@ -39,7 +39,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -74,7 +74,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         sink.initialize()
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -90,7 +90,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -107,7 +107,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         (1..8).map { async { sink.initialize() } }.awaitAll()
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -127,7 +127,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         jobs.awaitAll()
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -163,7 +163,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         sink.initialize()
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM $schema.mq_properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM $schema.mq_properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -201,7 +201,7 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         }
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))
@@ -211,9 +211,9 @@ class SchemaSetupTest : AbstractPgsqlTest() {
     }
 
     // setProperty is an upsert, but initializeMQSchema only ever reaches its insert: with a single
-    // migration it writes schema_version exactly once per fresh database, so the ON CONFLICT branch
-    // is unreachable through any public path. Exercised directly here so that whoever adds a second
-    // migration is not the first to find out whether it works.
+    // migration it writes message_queue_schema_version exactly once per fresh database, so the ON
+    // CONFLICT branch is unreachable through any public path. Exercised directly here so that
+    // whoever adds a second migration is not the first to find out whether it works.
     @Test
     fun setPropertyOverwritesAnExistingValue() = runTest(timeout = 5.seconds) {
         val prefix = uniquePrefix()
@@ -222,6 +222,8 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         val tables = MQTables.named(
             properties = "${prefix}properties",
             messages = "${prefix}messages",
+            crons = "${prefix}crons",
+            cronTicks = "${prefix}cron_ticks",
         )
         val probe = Property("d5_probe", Property.Encoder.StringEncoder)
 
@@ -236,16 +238,16 @@ class SchemaSetupTest : AbstractPgsqlTest() {
         }
     }
 
-    // A corrupted or hand-edited schema_version must not read as "not yet migrated" — that treats a
-    // data problem as an ordinary fresh database and re-runs the migration against tables that
-    // already exist, surfacing as "CREATE TABLE ... already exists" rather than naming the actual
-    // cause.
+    // A corrupted or hand-edited message_queue_schema_version must not read as "not yet migrated"
+    // — that treats a data problem as an ordinary fresh database and re-runs the migration against
+    // tables that already exist, surfacing as "CREATE TABLE ... already exists" rather than naming
+    // the actual cause.
     @Test
     fun anUnreadableSchemaVersionFailsInitializationRatherThanReMigrating() = runTest(timeout = 5.seconds) {
         val prefix = uniquePrefix()
         MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
 
-        dataSource.rawSetProperty(prefix, "schema_version", "not-a-number")
+        dataSource.rawSetProperty(prefix, "message_queue_schema_version", "not-a-number")
 
         val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
         val failure = assertFailsWith<IllegalStateException> { sink.initialize() }

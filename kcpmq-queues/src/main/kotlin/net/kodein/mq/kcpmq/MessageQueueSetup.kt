@@ -4,18 +4,10 @@ package net.kodein.mq.kcpmq
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.sql.Connection
 import kotlin.use
 
 
-internal object Setup {
-    context(tables: MQTables)
-    private suspend fun initializePropertiesTable(connection: Connection) = withContext(Dispatchers.IO) {
-        connection.prepareStatement("CREATE TABLE IF NOT EXISTS ${tables.properties} (key VARCHAR(32) PRIMARY KEY, value TEXT)").use {
-            it.execute()
-        }
-    }
-
+internal object MessageQueueSetup {
     // One list per version step, each entry rendering one statement from the table names.
     private val mqMigrations: List<List<MQTables.() -> String>> = listOf(
         // 0 -> 1
@@ -94,6 +86,10 @@ internal object Setup {
     context(tables: MQTables)
     internal suspend fun initializeMQSchema(source: Source): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
+            // Shared and idempotent — whichever sink (or process) gets here first creates
+            // it; everyone else's call is a no-op. Neither sink owns it exclusively.
+            Property.initializeTable(connection)
+
             connection.transaction {
                 // Reading the version and acting on it is a check-then-act across sessions, so it
                 // needs to be exclusive database-wide: the per-sink init Job only covers one
@@ -106,9 +102,8 @@ internal object Setup {
                     statement.execute()
                 }
 
-                initializePropertiesTable(connection)
                 val targetVersion = mqMigrations.size
-                var currentVersion = getProperty(Property.SchemaVersion) ?: 0
+                var currentVersion = getProperty(Property.MessageQueueSchemaVersion) ?: 0
 
                 // A version beyond what this build knows how to migrate to means the tables were
                 // migrated by a newer release. The loop below would simply not run and report
@@ -127,7 +122,7 @@ internal object Setup {
                         prepareStatement(sql(tables).trimIndent()).use { it.execute() }
                     }
                     ++currentVersion
-                    setProperty(Property.SchemaVersion, currentVersion)
+                    setProperty(Property.MessageQueueSchemaVersion, currentVersion)
                 }
             }
         }

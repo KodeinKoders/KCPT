@@ -1,0 +1,550 @@
+= KCPMQ Cron: how the algorithm works
+:toc: left
+:toclevels: 3
+:idprefix:
+:idseparator: -
+:icons: font
+:source-highlighter: highlight.js
+
+[.lead]
+A KCPMQ cron fires a *tick* every `interval`, exactly once across however many servers share the database, and keeps firing on a fixed wall-clock cadence no matter how long an individual tick takes to run.
+This document explains the two tables it uses, the loop every server runs, the safeguards that make the guarantees hold, and the corner cases that fall out of the design.
+
+toc::[]
+
+
+[[vocabulary]]
+== Vocabulary
+
+These terms are used precisely throughout this document and in the code.
+
+[cols="1,3"]
+|===
+| Term | Meaning
+
+| *Tick*
+| One execution of the user's handler for one time window.
+
+| *Window*
+| A half-open time range `[from, to)` that a tick is responsible for.
+Windows never overlap, and each one is handled exactly once (barring the at-least-once caveat in <<guarantees>>).
+
+| *Grid*
+| The fixed sequence of wall-clock boundaries the cron ticks on: `startAt`, `startAt + interval`, `startAt + 2×interval`, and so on.
+
+| *Cursor*
+| A single row in the `crons` table holding `next_slot_at` — the start of the next window that has not been created yet.
+It records how far *window creation* has progressed, and nothing else.
+
+| *Materialize*
+| To turn an implicit window — one that exists only as arithmetic on the cursor — into an actual row in `cron_ticks` that servers can claim.
+Before materialization a window is just "whatever the cursor says comes next"; after it, it is a durable unit of work.
+
+| *Lease*
+| A claim on a materialized window, taken by setting that row's `started_at`.
+While a lease is live, no other server may take that window.
+
+| *Reclaim*
+| Taking over a window whose lease has gone stale, which is how a crashed server's work gets picked up again.
+
+| *Note*
+| A JSON record of one failed attempt, appended to the row's `notes` array.
+The array's length is the attempt count.
+
+| *Dead-letter*
+| To give up on a window after too many failed attempts: the row is deleted, `onDeadLetter` is called, and the cron carries on with later windows.
+
+| *Catch-up chunk*
+| A wider-than-`interval` window, produced when the cron is far behind, so that a long outage does not turn into thousands of tiny ticks.
+
+| *Server*
+| One call to `Cron.run(...)`.
+Usually one per process, but nothing stops a process from making several.
+|===
+
+
+[[why-two-tables]]
+== Why two tables
+
+The obvious design is one row per cron, holding "where we are" and "is a tick running right now".
+That design cannot do what is needed, for two reasons.
+
+*It ties the schedule to processing time.*
+If the next tick's due date is written when the current tick finishes, then every tick's duration is added to the cadence.
+A 10-minute cron whose handler takes 8 seconds drifts by 8 seconds every tick.
+
+*It allows only one tick in flight.*
+If there is one row and one lease, a server that is 2 minutes into a slow tick is holding the only thing anyone could claim.
+A 1-minute cron would then tick every 2 minutes, however many idle servers are standing by.
+
+The fix is to split two concerns that the single-row design conflated:
+
+* *Deciding what the next window is* — cheap, purely arithmetic on the clock, and independent of whether any tick succeeded.
+* *Working a window* — slow, fallible, and worth retrying.
+
+Once those are separate, the first can race ahead of the second.
+Windows become independent rows, so several servers can each be working a different one, and the schedule keeps advancing on the clock regardless.
+
+
+[[the-schema]]
+== The schema
+
+Both tables belong to `CronSink` and are created by its own migration chain, independently of the message-queue tables.
+
+[source,sql]
+.The cursor: how far window creation has got
+----
+CREATE TABLE <prefix>crons (
+    name VARCHAR(32) PRIMARY KEY,
+    next_slot_at TIMESTAMPTZ NOT NULL
+)
+----
+
+That is the whole of it.
+The cursor is never touched by tick processing — success, failure, retry and reclaim all write to `cron_ticks` only.
+
+[source,sql]
+.The work items: one row per outstanding window
+----
+CREATE TABLE <prefix>cron_ticks (
+    name VARCHAR(32) NOT NULL,
+    from_at TIMESTAMPTZ NOT NULL,
+    to_at TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ DEFAULT NULL,
+    notes JSON NOT NULL DEFAULT '[]',
+    PRIMARY KEY (name, from_at)
+)
+----
+
+A row exists only while its window is outstanding.
+It is created when the window is materialized, and deleted when the tick succeeds or is dead-lettered.
+
+* `from_at` / `to_at` are fixed at creation and never recomputed.
+That is what makes a retry address the identical window rather than a wider one.
+* `started_at` is the lease: `NULL` means free, a timestamp means claimed at that moment.
+* `notes` accumulates one entry per failed attempt, and is reset only by the row ceasing to exist.
+
+There is no `due_at` column, unlike `messages`.
+A tick row is only ever created once its window has *already elapsed*, so it is due the instant it exists — there is nothing to schedule.
+
+Two partial indexes mirror the two halves of the queries below:
+
+[source,sql]
+----
+CREATE INDEX ON <prefix>cron_ticks (name, from_at)    WHERE started_at IS NULL;
+CREATE INDEX ON <prefix>cron_ticks (name, started_at) WHERE started_at IS NOT NULL;
+----
+
+
+[[the-run-loop]]
+== The run loop
+
+Every server runs the same loop, and there is no leader.
+Each iteration tries three things in order, stopping at the first that has work.
+
+[source,kotlin]
+.The shape of `run()`
+----
+while (true) {
+    if (tryMaterialize()) continue   // job 1: create the next window, if one is due
+    when (tryLease()) {              // job 2: claim and run an existing window
+        is DeadLettered -> onDeadLetter(...)
+        is Leased       -> runTick(...)
+        is NoWork       -> awaitSomethingToDo(wakeUpAt())   // job 3: park
+    }
+}
+----
+
+
+[[job-1-materialize]]
+=== Job 1 — materialize
+
+One transaction, which either creates exactly one window or does nothing.
+
+[source,sql]
+----
+SELECT next_slot_at FROM <prefix>crons WHERE name = ? FOR UPDATE SKIP LOCKED
+----
+
+`FOR UPDATE` locks the cursor row for the rest of the transaction, so only one server anywhere can be creating a window for this cron at any instant.
+`SKIP LOCKED` means a server that loses that race gets zero rows back immediately instead of blocking, and simply moves on to job 2.
+
+If the row comes back, the window's end is decided:
+
+[source,kotlin]
+----
+if (now < nextSlotAt + interval) return false   // the window has not finished elapsing yet
+
+val behindBy = now - nextSlotAt
+val to = if (behindBy < interval * 2) nextSlotAt + interval               // steady state
+         else minOf(nextSlotAt + maxInterval, now)                        // catch-up
+----
+
+The steady-state branch is the one that keeps ticks on the clock.
+Note what it does *not* do: it never looks at `now` when computing `to`.
+The window ends at the exact grid boundary whether this materialization happened right on time or 30 seconds late, so lateness never accumulates into the schedule.
+
+The transaction then inserts the row, advances the cursor past it, and notifies:
+
+[source,sql]
+----
+INSERT INTO <prefix>cron_ticks (name, from_at, to_at) VALUES (?, ?, ?)
+    ON CONFLICT (name, from_at) DO NOTHING;
+UPDATE <prefix>crons SET next_slot_at = ? WHERE name = ?;   -- set to `to`
+SELECT pg_notify(...);
+----
+
+The cursor advances *at materialization*, not at completion.
+Nothing about this transaction depends on whether any earlier tick succeeded, which is precisely why creation can run ahead of processing.
+
+`tryMaterialize()` returns `true` when it created a window, and the loop then ``continue``s straight back to job 1 rather than falling through to job 2.
+That matters during catch-up: one server can materialize chunk after chunk in quick succession, each committing and notifying independently, so idle servers can start on chunk 1 while this one is still creating chunk 3.
+
+
+[[job-2-lease]]
+=== Job 2 — lease and run
+
+[source,sql]
+----
+SELECT from_at, to_at, started_at, notes
+FROM <prefix>cron_ticks
+WHERE name = ?
+  AND (started_at IS NULL OR started_at < ?)   -- now - (tickTimeout + tickGrace)
+ORDER BY from_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+----
+
+`ORDER BY from_at` takes the oldest outstanding window first.
+`SKIP LOCKED` here does something subtly different from job 1: because there can be *several* candidate rows, a server whose first choice is locked by someone else is handed the next one down instead of nothing.
+Contention resolves into useful work rather than into a retry.
+
+A row whose `started_at` is not `NULL` is a *reclaim* — the previous holder never reported back — so a `leaseExpired` note is appended before anything else happens.
+If that pushes the attempt count past `retries`, the row is deleted and reported as dead-lettered without ever running the handler again; there is no point running a tick that is already out of attempts.
+
+Otherwise the lease is taken in the same transaction — `started_at = now`, notes written — and the handler runs.
+The three outcomes:
+
+[cols="1,3"]
+|===
+| Outcome | What is written
+
+| Success
+| `DELETE` the row, then call `onSuccess`.
+There is nothing left to track once a window is done.
+
+| Failure, attempts still available
+| `UPDATE` the row: `started_at = NULL`, notes appended — then `NOTIFY`.
+The window is immediately claimable again, by this server or any other.
+
+| Failure, attempts exhausted
+| `DELETE` the row, then call `onDeadLetter`.
+The cursor is untouched, so the cron simply continues with later windows.
+|===
+
+Note that the cursor is irrelevant to all three.
+"Skip the broken window and carry on" needs no special handling, because creation moved past that window the moment it was materialized.
+
+
+[[job-3-wait]]
+=== Job 3 — wait
+
+When there is nothing to create and nothing to claim, the server works out the earliest moment that could change:
+
+[source,sql]
+----
+SELECT LEAST(
+    (SELECT next_slot_at FROM <prefix>crons WHERE name = ?) + ?::interval,
+    (SELECT min(started_at) FROM <prefix>cron_ticks
+      WHERE name = ? AND started_at IS NOT NULL) + ?::interval
+)
+----
+
+The first branch is when the next window becomes materializable — `next_slot_at + interval`.
+The second is when the earliest live lease goes stale and becomes reclaimable — `min(started_at) + tickTimeout + tickGrace`.
+
+NOTE: PostgreSQL's `LEAST` ignores `NULL` arguments and returns `NULL` only when every argument is `NULL`.
+So when no lease is outstanding, the second branch simply drops out, and the result is the materialization time.
+
+The server then parks until that moment *or* until a notification arrives, whichever comes first:
+
+[source,kotlin]
+----
+if (wait > Duration.ZERO) withTimeoutOrNull(wait) { notifications.receive() }
+----
+
+A notification is fired whenever a window is materialized or a failed window is released for retry — that is, whenever a row becomes newly claimable.
+Unlike `MessageQueue`, the payload is ignored: there is no "how soon" to compare against, because a tick row is claimable the moment it exists.
+Any notification just means "go round the loop again".
+
+One `LISTEN` connection is opened per `run()` call and held for its whole life, then torn down in a `finally`.
+
+
+[[worked-example]]
+== A worked example: a 10-minute cron on five servers
+
+Five processes each call `cronSink.cron("nightly", Cron.Config(interval = 10.minutes))` and then `run { from, to -> ... }`.
+
+1. *Registration.*
+`INSERT ... ON CONFLICT (name) DO NOTHING` means only the first of the five calls creates the cursor; the other four are no-ops.
+The cursor starts at `T0`, the time of that first call.
+2. *All five park until `T0+10m`.*
+Job 1 finds the window has not elapsed, job 2 finds no rows at all, job 3 computes `T0 + 10m` and sleeps.
+3. *At `T0+10m`, one server materializes.*
+Whichever wins the cursor lock computes `behindBy ≈ 10m`, takes the steady-state branch, and creates `[T0, T0+10m)`.
+It advances the cursor to `T0+10m` and notifies.
+The other four get `SKIP LOCKED` misses — cheap — and fall through.
+4. *One server leases it.*
+All five race for the new row; one sets `started_at` and runs the handler.
+The other four get nothing and park again.
+5. *The winner finishes.*
+The row is deleted and `onSuccess` fires.
+6. *Everyone converges again*, this time on `T0+20m`, and the cycle repeats.
+
+Nothing pins a particular server to a particular role.
+The server that materializes a window is often not the one that ends up running it.
+
+[TIP]
+====
+If the handler takes longer than `interval`, step 3 happens *again* while step 4's winner is still working.
+A second window is created, a second server claims it, and the two run side by side.
+That is the whole point of the design: cadence is preserved as long as there are enough servers to absorb the work.
+====
+
+
+[[safeguards]]
+== Safeguards
+
+Each guarantee in <<guarantees>> rests on a specific mechanism.
+They are separated here so that each one can be reasoned about — and deliberately broken in a test — on its own.
+
+
+[[safeguard-one-server-per-window]]
+=== One server per window
+
+Guaranteed by `SELECT ... FOR UPDATE SKIP LOCKED` followed, in the same transaction, by the `UPDATE` that sets `started_at`.
+A concurrent transaction either skips the locked row, or — once the first commits — no longer matches `started_at IS NULL`.
+
+
+[[safeguard-one-materializer]]
+=== One materializer at a time
+
+The cursor row's own `FOR UPDATE` lock serialises window creation.
+Materialization is therefore always sequential, even though processing is concurrent.
+The `ON CONFLICT (name, from_at) DO NOTHING` on the insert is belt-and-braces: the cursor lock already makes a duplicate impossible, and the cursor only ever moves forward.
+
+
+[[safeguard-lease-expiry]]
+=== Lease expiry and reclaim
+
+A crashed server leaves `started_at` set and nothing to clear it.
+After `tickTimeout + tickGrace`, the row matches the lease query again and another server reclaims it, recording a `leaseExpired` note so the attempt still counts against `retries`.
+`tickGrace` exists so that a holder's own `withTimeout` always fires — and writes its failure — before anyone else may take the window from under it.
+
+
+[[safeguard-keepalive]]
+=== Keepalive
+
+`timeout` bounds the handler; `tickTimeout` bounds the lease.
+They are deliberately separate, because a tick that legitimately runs longer than a lease needs the lease refreshed underneath it.
+Passing `keepalive` launches a coroutine that re-stamps `started_at` on that cadence for as long as the handler runs.
+
+Because getting this pairing wrong is silent on both sides — the window simply runs twice, on two servers, with nothing reporting it — `run` refuses the combinations that would allow it rather than letting them be discovered in production.
+See <<corner-timeout-above-lease>>.
+
+
+[[safeguard-retries]]
+=== Retries and dead-lettering
+
+Each failure appends a note; the array's length is the attempt count.
+Once it exceeds `retries` the window is dead-lettered: deleted, reported, and stepped over.
+Because the cursor is independent, dead-lettering a window has no effect on any other.
+
+
+[[safeguard-write-back]]
+=== Write-back survives cancellation
+
+The failure write-back runs inside `withContext(NonCancellable)`, so cancelling a server still records why its in-flight tick stopped, and still releases the lease.
+The three ways a tick can end abnormally are told apart:
+
+* `TimeoutCancellationException` — the handler outran `timeout`.
+* `CancellationException` with the scope still active — the handler surfaced someone else's cancellation; treated as an ordinary failure, and `run()` carries on.
+* `CancellationException` with the scope cancelled — the caller cancelled `run()` itself; the failure is recorded and then the cancellation is re-raised by `ensureActive()`, so it reaches the caller.
+
+CAUTION: `isActive` is read *before* entering `NonCancellable`, because `NonCancellable` is an always-active job that would otherwise mask the real state and make every cancellation look like a foreign one.
+
+
+[[safeguard-callbacks]]
+=== Callbacks cannot break the loop
+
+`onSuccess`, `onFailure`, `onDeadLetter` and `onError` are user code on the bookkeeping path, so each is wrapped in a `try`/`catch` that swallows.
+`recordSuccess` also runs *before* `onSuccess`, so a throwing success callback cannot retroactively turn a completed tick into a failed one.
+
+
+[[safeguard-infrastructure]]
+=== Infrastructure errors do not kill the cron
+
+`run()` returns `Nothing` and is expected to live for the process's lifetime.
+A dropped connection or an exhausted pool in any of the three jobs is reported through `onError` and followed by a `tickGrace` pause, rather than propagating.
+Only a genuine cancellation ends the loop.
+
+NOTE: There is no jittered backoff for lost races, unlike a queue consumer.
+Losing the cursor lock leaves job 2 to try; losing a row lock leaves the next row to try; genuinely having nothing to do leaves a real, computed wait.
+A blind sleep would have nothing to add.
+
+
+[[catch-up]]
+== Catch-up after downtime
+
+When the cron has been down, `behindBy` exceeds `2 × interval` and materialization switches to the catch-up branch:
+
+[source,kotlin]
+----
+to = minOf(nextSlotAt + maxInterval, now)
+----
+
+The window is widened to swallow as much of the backlog as `maxInterval` allows, so a three-day outage on a 10-minute cron becomes a handful of wide ticks instead of 432 narrow ones.
+
+.Worked example: down from Monday 10:00 to Thursday 08:00, `interval` = 10 minutes, `maxInterval` = 1 day
+[cols="1,2,2"]
+|===
+| Pass | Window created | Cursor after
+
+| 1
+| `[Mon 10:00, Tue 10:00)` — capped at `maxInterval`
+| Tue 10:00
+
+| 2
+| `[Tue 10:00, Wed 10:00)` — capped at `maxInterval`
+| Wed 10:00
+
+| 3
+| `[Wed 10:00, Thu 08:00)` — clamped to `now`
+| Thu 08:00
+
+| 4
+| none: `behindBy` is now below `interval`
+| Thu 08:00
+|===
+
+All three chunks are created in a rapid burst, each committing and notifying as it lands, so the three of them can be worked by three different servers simultaneously.
+The cron then resumes normally, next ticking at Thursday 08:10 for `[Thu 08:00, Thu 08:10)`.
+
+IMPORTANT: The grid re-anchors after catch-up.
+The last chunk ends at `now`, so subsequent boundaries are measured from the instant the cron caught up, not from the original `startAt`.
+A cron that was aligned to `:00`, `:10`, `:20` before an outage will be aligned to something else afterwards.
+
+
+[[corner-cases]]
+== Corner cases
+
+These are the situations where the design's behaviour is least obvious from the code alone.
+Several were found by writing tests against the implementation rather than by reading it.
+
+
+[[corner-slow-handler]]
+=== A handler slower than the interval
+
+Windows accumulate as rows and are handed to whichever servers are free.
+With enough servers, cadence is unaffected.
+With too few, the backlog grows and ticks fall behind — and if it grows past `2 × interval` of lateness, materialization starts producing catch-up chunks, which is the system compressing the backlog rather than letting it run away.
+
+
+[[corner-timeout-above-lease]]
+=== Running a handler for longer than its lease
+
+`timeout` bounds the handler and `tickTimeout` bounds the lease, so raising the first above the second opens a window in which the lease goes stale while the handler is still working — another server reclaims it, and the same window runs twice, concurrently, with nothing anywhere reporting it.
+
+This is the only failure in the design that is silent on both sides, so `Cron.run` refuses the two configurations that cause it:
+
+[source,kotlin]
+----
+require(keepalive == null || keepalive < config.tickTimeout) { ... }              // <1>
+require(keepalive != null || timeout <= config.tickTimeout + config.tickGrace) { ... }  // <2>
+----
+<1> A keepalive slower than `tickTimeout` lets the lease go stale between refreshes.
+It is checked against `tickTimeout` alone rather than `tickTimeout + tickGrace`, leaving the grace period as headroom for the refresh's own round trip — the same margin ``workerPool``'s equivalent check leaves against `processingTimeout`.
+<2> Without a keepalive nothing re-stamps the lease at all, so a handler allowed to outlive it is *guaranteed* to still be running at the reclaim.
+This is the likelier mistake of the two: the first check is vacuous when `keepalive` is null, which is exactly the case where a raised `timeout` is most tempting.
+
+So the supported ways to run a tick for longer than `tickTimeout` are to pass a `keepalive` shorter than `tickTimeout`, or to raise `tickTimeout` to match the work.
+The defaults (`timeout` = `tickTimeout`, no keepalive) satisfy the second check trivially.
+
+
+[[corner-missing-cursor]]
+=== The cursor row is deleted by hand
+
+`SKIP LOCKED` cannot distinguish "no row" from "someone else holds it", so job 1 cannot detect this.
+Job 3 can: `LEAST(...)` returns `NULL` only when both subqueries are `NULL`, which means there is no cursor and no live lease.
+`run()` treats that as "re-seed me" and calls `register()` again, which recreates the cursor from the original `startAt`.
+
+
+[[corner-clock-backwards]]
+=== The clock moves backwards
+
+`to` is always strictly greater than `from`: the steady-state branch adds a positive `interval`, and the catch-up branch is only reached when `now` is already more than `2 × interval` past the cursor.
+No degenerate or inverted window can be created, so — unlike the single-row design this replaced — no defensive check is needed.
+
+
+[[corner-completion-order]]
+=== Windows complete out of order
+
+Windows are created in order and never overlap, but nothing serialises their *completion*.
+Window 3 may finish before window 2 if window 2's server is slow or retrying.
+
+IMPORTANT: If your handler's work must be applied in chronological order, do not rely on the cron for that ordering.
+Run one server, or make the handler's effects order-independent.
+
+
+[[corner-thundering-herd]]
+=== Every server wakes on the same notification
+
+They do, and they all race.
+The losers pay one skipped `SELECT` each, which is why no backoff is needed: `SKIP LOCKED` turns contention into a cheap miss rather than a blocked connection.
+
+
+[[corner-run-immediately]]
+=== `runImmediately` on a short interval
+
+`runImmediately = true` seeds the cursor at `startAt - interval` so the first window is already elapsed at `startAt`.
+That halves the margin before the catch-up threshold: any startup latency exceeding `interval` — schema creation on a fresh database, for instance — pushes `behindBy` past `2 × interval`, and the very first tick is created as a catch-up chunk clamped to `now` rather than as a clean grid slot.
+
+The first window is `[startAt - interval, startAt)` — a range that precedes the cron's own existence.
+`runImmediately` is about *when the first tick fires*, not about giving it a meaningful window.
+
+
+[[corner-notes-lifetime]]
+=== Notes disappear on success
+
+`notes` lives on the row, and the row is deleted when the window completes.
+Anything that needs the attempt history must read it from inside the handler, or capture it from `onFailure` / `onDeadLetter`.
+
+
+[[corner-reclaim-no-notify]]
+=== A reclaim is not notified
+
+Materialization and retry-release both `NOTIFY`, because both make a row newly claimable at an unpredictable moment.
+A reclaim is not notified, because it becomes available at a time every waiting server has already computed for itself — it is the second branch of the `LEAST` in job 3.
+
+
+[[guarantees]]
+== Guarantees and non-guarantees
+
+The cron guarantees:
+
+* Each window is handed to at most one server at a time.
+* Windows are contiguous and non-overlapping.
+* Cadence follows the clock, not the handlers' durations, as long as servers are available.
+* A crashed server's window is picked up by another within `tickTimeout + tickGrace`.
+* A permanently failing window is given up on after `retries` and does not block later windows.
+
+The cron does *not* guarantee:
+
+* *Exactly-once execution.*
+If a handler succeeds but the `DELETE` that records it fails, the lease eventually expires and the window is run again.
+This is the same at-least-once shape as `MessageQueue`, and handlers should be idempotent.
+* *Completion in window order*, as described in <<corner-completion-order>>.
+* *A stable grid across outages*, as described in <<catch-up>>.
+* *Alignment to round clock values.*
+The grid is anchored at `startAt`, not snapped to `:00`.
+A cron registered at 09:03 with a 10-minute interval ticks at 09:13, 09:23, and so on.

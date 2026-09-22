@@ -21,7 +21,31 @@ internal class Property<T : Any>(val key: String, val encoder: Encoder<T>) {
         }
     }
     companion object {
-        val SchemaVersion = Property("schema_version", Encoder.IntEncoder)
+        val MessageQueueSchemaVersion = Property("message_queue_schema_version", Encoder.IntEncoder)
+        val CronSchemaVersion = Property("cron_schema_version", Encoder.IntEncoder)
+
+        // Called before MessageQueueSetup's own transaction (under its messages-keyed lock) and
+        // before CronSetup's (under its crons-keyed lock), in a separate transaction of its own —
+        // two different locks downstream, so without a lock here, a MessageQueueSink and a
+        // CronSink initializing concurrently on the same prefix could both reach CREATE TABLE IF
+        // NOT EXISTS at once. That statement is not atomic against a concurrent creator (same
+        // reasoning as initializeMQSchema's own lock), and the loser would fail with a duplicate
+        // pg_type catalog entry rather than seeing the table the winner just made. Keyed on
+        // tables.properties, independent of either sink's own lock, since it protects a resource
+        // neither sink owns exclusively.
+        context(tables: MQTables)
+        internal suspend fun initializeTable(connection: Connection) = withContext(Dispatchers.IO) {
+            connection.transaction {
+                connection.prepareStatement("SELECT pg_advisory_xact_lock(?)").use { statement ->
+                    statement.setLong(1, "kcpmq:${tables.properties}".hashCode().toLong())
+                    statement.execute()
+                }
+                connection.prepareStatement("CREATE TABLE IF NOT EXISTS ${tables.properties} (key VARCHAR(32) PRIMARY KEY, value TEXT)").use {
+                    it.execute()
+                }
+            }
+        }
+
     }
 }
 

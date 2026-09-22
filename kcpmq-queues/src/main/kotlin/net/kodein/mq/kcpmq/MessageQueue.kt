@@ -441,7 +441,7 @@ internal class MessageQueueImpl<T> internal constructor(
     }
 
     private companion object {
-        // The width of the queue column declared in Setup.kt's CREATE TABLE.
+        // The width of the queue column declared in MessageQueueSetup.kt's CREATE TABLE.
         const val MAX_NAME_LENGTH = 32
     }
 }

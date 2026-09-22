@@ -52,7 +52,7 @@ class MessageQueueSinkTest : AbstractPgsqlTest() {
         MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).messageQueue(uniqueQueueName(), User.serializer())
 
         dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'schema_version'").use { statement ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
                 statement.executeQuery().use { resultSet ->
                     kotlin.test.assertTrue(resultSet.next())
                     assertEquals("1", resultSet.getString(1))

@@ -5,6 +5,8 @@ package net.kodein.mq.kcpmq
 internal data class MQTables private constructor(
     val properties: String,
     val messages: String,
+    val crons: String,
+    val cronTicks: String,
 ) {
     companion object {
         // Table names are interpolated into statement text as identifiers, which no escaping
@@ -26,9 +28,13 @@ internal data class MQTables private constructor(
         fun named(
             properties: String,
             messages: String,
+            crons: String,
+            cronTicks: String,
         ) = MQTables(
             properties = validated(properties),
             messages = validated(messages),
+            crons = validated(crons),
+            cronTicks = validated(cronTicks),
         )
     }
 }

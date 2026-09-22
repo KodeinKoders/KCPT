@@ -269,3 +269,115 @@ fun HikariDataSource.rawSetProperty(prefix: String, key: String, value: String) 
             statement.executeUpdate()
         }
     }
+
+// Seeds (or overwrites) a cron's cursor row directly, bypassing CronSink.cron()'s registration
+// entirely — the way a test backdates a scenario (e.g. simulating downtime) rather than waiting
+// for real time to pass.
+fun HikariDataSource.rawInsertCronCursor(prefix: String, name: String, nextSlotAt: Instant) =
+    connection.use { connection ->
+        connection.prepareStatement(
+            """
+                INSERT INTO ${prefix}crons (name, next_slot_at) VALUES (?, ?)
+                ON CONFLICT (name) DO UPDATE SET next_slot_at = EXCLUDED.next_slot_at
+            """.trimIndent()
+        ).use { statement ->
+            statement.setString(1, name)
+            statement.setInstant(2, nextSlotAt)
+            statement.executeUpdate()
+        }
+    }
+
+fun HikariDataSource.cronNextSlotAtOf(prefix: String, name: String): OffsetDateTime? =
+    connection.use { connection ->
+        connection.prepareStatement("SELECT next_slot_at FROM ${prefix}crons WHERE name = ?").use { statement ->
+            statement.setString(1, name)
+            statement.executeQuery().use { resultSet ->
+                if (!resultSet.next()) null else resultSet.getObject(1, OffsetDateTime::class.java)
+            }
+        }
+    }
+
+// Materializes a tick row directly, bypassing the normal materialize step — the way a test sets
+// up a lease/retry/reclaim scenario without needing a cron to actually reach that state on its
+// own.
+fun HikariDataSource.rawInsertCronTick(
+    prefix: String,
+    name: String,
+    fromAt: Instant,
+    toAt: Instant,
+    startedAt: Instant? = null,
+    notesJson: String = "[]",
+) = connection.use { connection ->
+    connection.prepareStatement(
+        """
+            INSERT INTO ${prefix}cron_ticks (name, from_at, to_at, started_at, notes)
+            VALUES (?, ?, ?, ?, ?::json)
+            ON CONFLICT (name, from_at) DO UPDATE SET
+                to_at = EXCLUDED.to_at,
+                started_at = EXCLUDED.started_at,
+                notes = EXCLUDED.notes
+        """.trimIndent()
+    ).use { statement ->
+        statement.setString(1, name)
+        statement.setInstant(2, fromAt)
+        statement.setInstant(3, toAt)
+        if (startedAt != null) statement.setInstant(4, startedAt) else statement.setNull(4, java.sql.Types.TIMESTAMP_WITH_TIMEZONE)
+        statement.setString(5, notesJson)
+        statement.executeUpdate()
+    }
+}
+
+fun HikariDataSource.countCronTicks(prefix: String, name: String): Int =
+    connection.use { connection ->
+        connection.prepareStatement("SELECT count(*) FROM ${prefix}cron_ticks WHERE name = ?").use { statement ->
+            statement.setString(1, name)
+            statement.executeQuery().use { resultSet -> resultSet.next(); resultSet.getInt(1) }
+        }
+    }
+
+// Every outstanding tick for a name, ordered by from_at — what a test reads to check which
+// windows have been materialized so far.
+fun HikariDataSource.cronTicksOf(prefix: String, name: String): List<Pair<OffsetDateTime, OffsetDateTime>> =
+    connection.use { connection ->
+        connection.prepareStatement("SELECT from_at, to_at FROM ${prefix}cron_ticks WHERE name = ? ORDER BY from_at").use { statement ->
+            statement.setString(1, name)
+            statement.executeQuery().use { resultSet ->
+                generateSequence {
+                    if (resultSet.next()) {
+                        resultSet.getObject(1, OffsetDateTime::class.java) to resultSet.getObject(2, OffsetDateTime::class.java)
+                    } else null
+                }.toList()
+            }
+        }
+    }
+
+fun HikariDataSource.cronTickStartedAtOf(prefix: String, name: String, fromAt: Instant): OffsetDateTime? =
+    connection.use { connection ->
+        connection.prepareStatement("SELECT started_at FROM ${prefix}cron_ticks WHERE name = ? AND from_at = ?").use { statement ->
+            statement.setString(1, name)
+            statement.setInstant(2, fromAt)
+            statement.executeQuery().use { resultSet ->
+                resultSet.next()
+                resultSet.getObject(1, OffsetDateTime::class.java)
+            }
+        }
+    }
+
+fun HikariDataSource.cronTickNotesJson(prefix: String, name: String, fromAt: Instant): String =
+    connection.use { connection ->
+        connection.prepareStatement("SELECT notes FROM ${prefix}cron_ticks WHERE name = ? AND from_at = ?").use { statement ->
+            statement.setString(1, name)
+            statement.setInstant(2, fromAt)
+            statement.executeQuery().use { resultSet -> resultSet.next(); resultSet.getString(1) }
+        }
+    }
+
+fun HikariDataSource.setCronTickStartedAt(prefix: String, name: String, fromAt: Instant, startedAt: Instant?) =
+    connection.use { connection ->
+        connection.prepareStatement("UPDATE ${prefix}cron_ticks SET started_at = ? WHERE name = ? AND from_at = ?").use { statement ->
+            if (startedAt != null) statement.setInstant(1, startedAt) else statement.setNull(1, java.sql.Types.TIMESTAMP_WITH_TIMEZONE)
+            statement.setString(2, name)
+            statement.setInstant(3, fromAt)
+            statement.executeUpdate()
+        }
+    }
