@@ -13,10 +13,12 @@ plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
-rootProject.name = "KCPMQ"
+rootProject.name = "KCPT"
 
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
 include(
-    ":kcpmq-queues",
+    ":kcpt-core",
+    ":kcpt-message-queue",
+    ":kcpt-cron",
 )

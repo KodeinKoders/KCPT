@@ -1,11 +1,20 @@
-= KCPMQ
+= KCPT
 :toc: macro
 :toclevels: 2
 :idprefix:
 :idseparator: -
 :source-highlighter: highlight.js
 
-*Message queues on PostgreSQL, driven by Kotlin coroutines — no broker to run.*
+*PostgreSQL-backed message queues and cron, driven by Kotlin coroutines — no broker to run.*
 
-KCPMQ turns a PostgreSQL database into a durable message queue.
-Producers post typed payloads, consumers receive them under a lease, and `LISTEN`/`NOTIFY` wakes a waiting consumer the moment a message lands.
+KCPT turns a PostgreSQL database into durable background-work infrastructure, with two independent
+pieces sharing the same underlying primitives (a lease, retries, `LISTEN`/`NOTIFY` wake-up):
+
+* **`kcpt-message-queue`** — producers post typed payloads, consumers receive them under a lease,
+and `LISTEN`/`NOTIFY` wakes a waiting consumer the moment a message lands. See
+xref:docs/message-queue-algorithm.adoc[how it works].
+* **`kcpt-cron`** — a tick fires every `interval`, exactly once across however many servers share
+the database, on a fixed wall-clock cadence no matter how long an individual tick takes to run. See
+xref:docs/cron-algorithm.adoc[how it works].
+
+Take either module on its own — neither depends on the other — or both, sharing one `kcpt-core`.

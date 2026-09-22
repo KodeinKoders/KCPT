@@ -1,0 +1,361 @@
+package net.kodein.kcpt.mq
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import net.kodein.kcpt.AbstractPgsqlTest
+import net.kodein.kcpt.asSource
+import net.kodein.kcpt.countingListenSource
+import net.kodein.kcpt.rawNotify
+import org.junit.Test
+import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+class WorkerPoolTest : AbstractPgsqlTest() {
+
+    @Test
+    fun workerPoolProcessesAllPostedMessages() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).messageQueue(queue, User.serializer())
+            (0..9).forEach { q.post(User(it, "u$it")) }
+
+            val poolJob = launch { q.workerPool { null } }
+            awaitUntil { dataSource.countMessages(prefix, queue) == 0 }
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun workerPoolRespectsNumberOfWorkersAsAConcurrencyCeiling() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix()).messageQueue(uniqueQueueName(), User.serializer())
+            (0..9).forEach { q.post(User(it, "u$it")) }
+
+            val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+            var maxInFlight = 0
+            val releaseGate = kotlinx.coroutines.sync.Mutex(locked = true)
+
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 3) { message ->
+                    val current = inFlight.incrementAndGet()
+                    synchronized(this) { maxInFlight = maxOf(maxInFlight, current) }
+                    releaseGate.withLock { }
+                    inFlight.decrementAndGet()
+                    null
+                }
+            }
+
+            delay(500.milliseconds) // let workers pile up against the gate
+            assertEquals(3, inFlight.get(), "expected exactly numberOfWorkers messages in flight")
+            releaseGate.unlock()
+
+            poolJob.cancelAndJoin()
+            assertEquals(3, maxInFlight)
+        }
+    }
+
+    // The blast radius of a notification that cannot be decoded: workerPool calls receive() inside
+    // its coroutineScope, so an exception escaping receive() cancels every in-flight worker. One
+    // NOTIFY from any session that can reach the database used to be enough.
+    @Test
+    fun workerPoolSurvivesAMalformedNotificationOnItsChannel() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer())
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1) { message -> processed += message.payload.id; null }
+            }
+            delay(600.milliseconds) // the pool is parked in receive(), listening
+
+            dataSource.rawNotify("${prefix}messages_$queue", "not-json-at-all")
+            delay(200.milliseconds)
+            q.post(User(1, "A"))
+
+            awaitUntil(
+                timeout = 10.seconds,
+                message = "the pool stopped processing after a notification it could not decode",
+            ) { processed.contains(1) }
+            assertTrue(poolJob.isActive, "the pool must survive a notification it cannot decode")
+
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun workerPoolRejectsKeepaliveNotLessThanTreatmentTimeout() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
+
+            assertFailsWith<IllegalArgumentException> {
+                q.workerPool(keepalive = 1.seconds) { null }
+            }
+        }
+    }
+
+    // The pool passes its own timeout down to process(), which applies the same bound again. When
+    // that timeout is shorter than the queue's processingTimeout, checking only against the queue's
+    // let a keepalive through here and threw from inside a launched worker instead — after a message
+    // had been received and leased, and fatally, since that exception cancels the pool's scope.
+    @Test
+    fun workerPoolRejectsKeepaliveNotLessThanItsOwnShorterTimeout() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
+                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 60.seconds))
+
+            assertFailsWith<IllegalArgumentException> {
+                q.workerPool(timeout = 30.seconds, keepalive = 45.seconds) { null }
+            }
+        }
+    }
+
+    @Test
+    fun workerPoolSurvivesAThrowingWorkLambda() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).messageQueue(queue, User.serializer())
+            q.post(User(1, "throws"))
+            q.post(User(2, "ok-a"))
+            q.post(User(3, "ok-b"))
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1) { message ->
+                    if (message.payload.name == "throws") {
+                        message.successDelete()
+                        throw RuntimeException("boom")
+                    }
+                    processed += message.payload.id
+                    null
+                }
+            }
+
+            withTimeoutOrNullAssert(5.seconds, "workerPool must keep running after one handler throws") {
+                awaitUntil { processed.containsAll(listOf(2, 3)) }
+            }
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    // The actual point of holding a Receiver for the pool's whole lifetime rather than calling
+    // receive() per iteration: one LISTEN for however many messages the pool processes, not one
+    // per message. Regresses to one-per-message if workerPool's loop ever goes back to calling
+    // receive() instead of the receiver it holds open.
+    @Test
+    fun workerPoolHoldsOneListenConnectionForItsWholeLifetime() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val listens = java.util.concurrent.atomic.AtomicInteger(0)
+            val q = MessageQueueSink(source = dataSource.countingListenSource(listens), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer())
+            (0..9).forEach { q.post(User(it, "u$it")) }
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1) { message -> processed += message.payload.id; null }
+            }
+            withTimeoutOrNullAssert(5.seconds, "workerPool must process every posted message") {
+                awaitUntil { processed.size == 10 }
+            }
+            poolJob.cancelAndJoin()
+
+            assertEquals(
+                1, listens.get(),
+                "workerPool must hold one listening connection for its whole lifetime, not reopen one per message",
+            )
+        }
+    }
+
+    // The blast radius of a requeue that fails: failureRequeue talks to the database like any other
+    // acknowledgement, so it can throw on a dropped connection. Unguarded, that exception would
+    // cancel the pool's scope and take every other in-flight message down with it.
+    @Test
+    fun workerPoolSurvivesARequeueThatFails() = runTest(timeout = 10.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asFailureRequeueFailingOnceSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
+            q.post(User(1, "throws"))
+            q.post(User(2, "ok-a"))
+            q.post(User(3, "ok-b"))
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val reported = ConcurrentLinkedQueue<kotlin.uuid.Uuid>()
+            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
+            var poisonedId: kotlin.uuid.Uuid? = null
+            val poolJob = launch {
+                q.workerPool(
+                    numberOfWorkers = 1,
+                    onRequeueFailure = { message, _, _ -> reported += message.id },
+                ) { message ->
+                    if (message.payload.name == "throws") {
+                        poisonedId = message.id
+                        attempts.incrementAndGet()
+                        throw RuntimeException("boom")
+                    }
+                    processed += message.payload.id
+                    null
+                }
+            }
+
+            withTimeoutOrNullAssert(5.seconds, "workerPool must keep running after a requeue fails") {
+                awaitUntil { processed.containsAll(listOf(2, 3)) }
+            }
+            assertTrue(poolJob.isActive, "the pool must survive a requeue that fails")
+            assertEquals(1, reported.size, "the failed requeue must be reported exactly once")
+            assertEquals(poisonedId, reported.firstOrNull())
+            assertNotNull(
+                dataSource.startedAtOf(prefix, poisonedId!!),
+                "the lease must stand: the UPDATE that would have cleared started_at is the one that failed",
+            )
+
+            withTimeoutOrNullAssert(8.seconds, "the message must eventually be redelivered once its lease expires") {
+                awaitUntil { attempts.get() >= 2 }
+            }
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun workerPoolRequeuesAMessageThatExceedsWorkTimeout() = runTest(timeout = 10.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 500.milliseconds))
+            q.post(User(1, "slow"))
+
+            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
+            val poolJob = launch {
+                q.workerPool(numberOfWorkers = 1, timeout = 500.milliseconds) { message ->
+                    if (attempts.incrementAndGet() == 1) {
+                        delay(5.seconds) // exceeds workTimeout: should be requeued, not lost
+                    }
+                    null
+                }
+            }
+
+            withTimeoutOrNullAssert(8.seconds, "the timed-out message should have been requeued and eventually reprocessed") {
+                awaitUntil { attempts.get() >= 2 }
+            }
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    // Under default settings no keepalive is needed, and none is configured: workerPool's timeout
+    // equals the queue's processingTimeout, so the holder's own withTimeout fires and hands the
+    // message back a whole processingGrace before anyone could reclaim it. The message is therefore
+    // requeued by its own worker — and then redelivered, promptly, since a parked receive() wakes on
+    // the lease deadline — but it is never extended, and never worked by two workers at once.
+    //
+    // started_at cannot tell those apart: it advances on an extension AND on a redelivery. The
+    // notes can — extend() never writes them, so a note is proof the message was handed back rather
+    // than held on to.
+    @Test
+    fun workThatOverrunsIsRequeuedRatherThanExtendedUnderDefaultSettings() = runTest(timeout = 20.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
+            q.post(User(1, "A"))
+
+            var messageId: kotlin.uuid.Uuid? = null
+            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
+            val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+            val maxInFlight = java.util.concurrent.atomic.AtomicInteger(0)
+
+            val poolJob = launch {
+                q.workerPool { message ->
+                    messageId = message.id
+                    attempts.incrementAndGet()
+                    val current = inFlight.incrementAndGet()
+                    maxInFlight.updateAndGet { maxOf(it, current) }
+                    try {
+                        delay(5.seconds) // overruns processingTimeout, so this attempt is timed out
+                        null
+                    } finally {
+                        // In a finally, so a timed-out attempt is counted out again. Below the
+                        // delay it would never run, and the counter would tally attempts rather
+                        // than concurrency.
+                        inFlight.decrementAndGet()
+                    }
+                }
+            }
+
+            // The first attempt overran and was handed back; a second one means it was redelivered
+            // rather than stranded.
+            awaitUntil(timeout = 10.seconds) { attempts.get() >= 2 }
+            poolJob.cancelAndJoin()
+
+            assertEquals(1, maxInFlight.get(), "the message was worked by two workers at once")
+
+            val notes = Json.parseToJsonElement(dataSource.readNotesJson(prefix, messageId!!)) as JsonArray
+            assertTrue(notes.isNotEmpty(), "the overrun must be recorded as a failed try")
+            assertEquals(
+                JsonPrimitive("timeout"),
+                (notes.first() as JsonObject)["cause"],
+                "the holder's own timeout must be what handed the message back — a reclaim would " +
+                    "read leaseExpired, and an extension would have written no note at all",
+            )
+        }
+    }
+
+    // The path where a keepalive genuinely is needed: an explicit timeout longer than the lease.
+    @Test
+    fun keepaliveIsActiveWhenWorkTimeoutExceedsTreatmentTimeout() = runTest(timeout = 8.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            val treatmentTimeout = 1.seconds
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = treatmentTimeout))
+            q.post(User(1, "A"))
+
+            var messageId: kotlin.uuid.Uuid? = null
+            val poolJob = launch {
+                q.workerPool(timeout = treatmentTimeout * 3, keepalive = treatmentTimeout / 3) { message ->
+                    messageId = message.id
+                    delay(2500.milliseconds) // longer than treatmentTimeout, shorter than workTimeout
+                    null
+                }
+            }
+
+            awaitUntil { messageId != null }
+            val before = dataSource.startedAtOf(prefix, messageId!!)
+            assertNotNull(before)
+            delay(1800.milliseconds) // well past treatmentTimeout
+            val after = dataSource.startedAtOf(prefix, messageId)
+            assertNotNull(after)
+            assertTrue(after.isAfter(before), "keepalive should have extended started_at past the treatment timeout")
+
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    private suspend fun <T> withTimeoutOrNullAssert(timeout: kotlin.time.Duration, message: String, block: suspend () -> T): T {
+        return kotlinx.coroutines.withTimeoutOrNull(timeout) { block() } ?: throw AssertionError(message)
+    }
+}

@@ -1,4 +1,4 @@
-= KCPMQ Message Queue: how the algorithm works
+= KCPT Message Queue: how the algorithm works
 :toc: left
 :toclevels: 3
 :idprefix:
@@ -7,7 +7,7 @@
 :source-highlighter: highlight.js
 
 [.lead]
-A KCPMQ message queue hands each posted message to exactly one consumer at a time, across however many servers share the database, and takes it back if that consumer dies without saying what happened.
+A KCPT message queue hands each posted message to exactly one consumer at a time, across however many servers share the database, and takes it back if that consumer dies without saying what happened.
 This document explains the single table it uses, how posting and receiving work, what `process()` guarantees around a handler, how `workerPool` turns that into a running consumer, and the corner cases that fall out of the design.
 
 It is the companion to xref:cron-algorithm.adoc[the cron algorithm document], which describes a system built on the same primitives.
@@ -365,7 +365,7 @@ It returns `Nothing` — it ends only by cancellation or by a receive that fails
 
 [source,kotlin]
 ----
-newFixedThreadPoolContext(numberOfThreads, "KCPMQ-WorkerPool").use { dispatcher ->
+newFixedThreadPoolContext(numberOfThreads, "KCPT-WorkerPool").use { dispatcher ->
     val semaphore = Semaphore(numberOfWorkers)
     coroutineScope {
         receiver(this).use { receiver ->

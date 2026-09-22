@@ -1,0 +1,139 @@
+@file:Suppress("SqlSourceToSinkFlow")
+
+package net.kodein.kcpt.mq
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import net.kodein.kcpt.Property
+import net.kodein.kcpt.Source
+import net.kodein.kcpt.getProperty
+import net.kodein.kcpt.setProperty
+import net.kodein.kcpt.transaction
+import kotlin.use
+
+
+// Its own version, independent of CronSetup's: the two feature modules migrate on their own
+// schedule, and this is the property key that tracks this module's alone.
+internal val messageQueueSchemaVersion = Property("message_queue_schema_version", Property.Encoder.IntEncoder)
+
+internal object MessageQueueSetup {
+    // One list per version step, each entry rendering one statement from the table names.
+    private val mqMigrations: List<List<MessageQueueTables.() -> String>> = listOf(
+        // 0 -> 1
+        listOf(
+            {
+                // language="PostgreSQL"
+                """
+                    CREATE TABLE $messages (
+                        queue VARCHAR(32) NOT NULL,
+                        id UUID NOT NULL,
+                        due_at TIMESTAMPTZ NOT NULL,
+                        started_at TIMESTAMPTZ DEFAULT NULL,
+                        payload JSON NOT NULL,
+                        -- NOT NULL, not merely defaulted: both selection queries filter on
+                        -- json_array_length(notes) < ?, and json_array_length(NULL) is NULL,
+                        -- so the predicate is neither true nor false and the row is never
+                        -- selected — not for delivery, not for retry, not for dead-lettering.
+                        -- It would sit in the table forever, invisible to every code path and
+                        -- to maxTries. A foreign writer omitting notes from an explicit column
+                        -- list is exactly how that happens, and this library expects those.
+                        notes JSON NOT NULL DEFAULT '[]',
+                        PRIMARY KEY(queue, id)
+                    )
+                """
+            },
+            {
+                // Serves the wake-up query's min(due_at) subquery in receiveNext, which asks for
+                // the next message due in the strict future and so carries `started_at IS NULL` on
+                // its own. It cannot serve the selection query below: that one tests
+                // `started_at IS NULL OR started_at < ?`, and PostgreSQL uses a partial index only
+                // where the query's predicate implies the index's, which a disjunction never does.
+                // language="PostgreSQL"
+                """
+                    CREATE INDEX
+                    ON $messages (queue, due_at)
+                    WHERE started_at IS NULL
+                """
+            },
+            {
+                // Serves receiveNextOrNull's selection query — the hot path, run for every single
+                // delivery. queue leads for its equality, due_at takes the range, and id completes
+                // `ORDER BY due_at, id` so the LIMIT 1 stops at the first matching entry instead of
+                // sorting the table. Without this the only other index is partial and unusable
+                // here, and every delivery was a sequential scan followed by a sort. The
+                // started_at disjunction stays a filter — it cannot be indexed as written — but it
+                // is applied to rows already in the required order.
+                // language="PostgreSQL"
+                """
+                    CREATE INDEX
+                    ON $messages (queue, due_at, id)
+                """
+            },
+            {
+                // Serves the wake-up query's other subquery: min(started_at) WHERE queue = ? AND
+                // started_at IS NOT NULL AND started_at > ?, run whenever the queue is not empty of
+                // in-flight messages. Unlike the partial index above, the query's own
+                // `started_at > ?` already implies `started_at IS NOT NULL` — a NULL comparison is
+                // never true — so the partial predicate here matches what the planner can prove,
+                // where the disjunction in the selection query could not.
+                // language="PostgreSQL"
+                """
+                    CREATE INDEX
+                    ON $messages (queue, started_at)
+                    WHERE started_at IS NOT NULL
+                """
+            },
+        ),
+    )
+
+
+    // A database-wide key, so every process initialising the same tables contends on the same
+    // lock. String.hashCode is specified by the JDK, so separate JVMs derive the same value.
+    context(tables: MessageQueueTables)
+    private fun advisoryLockKey(): Long = "kcpt:${tables.messages}".hashCode().toLong()
+
+    context(tables: MessageQueueTables)
+    internal suspend fun initializeMQSchema(source: Source): Unit = withContext(Dispatchers.IO) {
+        source().use { connection ->
+            // Shared and idempotent — whichever sink (or process) gets here first creates
+            // it; everyone else's call is a no-op. Neither sink owns it exclusively.
+            Property.initializeTable(connection)
+
+            connection.transaction {
+                // Reading the version and acting on it is a check-then-act across sessions, so it
+                // needs to be exclusive database-wide: the per-sink init Job only covers one
+                // instance. Without this, two processes starting together both read version 0 and
+                // both run the migration, and the loser fails on an already-created table —
+                // CREATE TABLE IF NOT EXISTS is not atomic against a concurrent creator either.
+                // The lock is transaction-scoped, so it is released by the commit or rollback.
+                prepareStatement("SELECT pg_advisory_xact_lock(?)").use { statement ->
+                    statement.setLong(1, advisoryLockKey())
+                    statement.execute()
+                }
+
+                val targetVersion = mqMigrations.size
+                var currentVersion = getProperty(messageQueueSchemaVersion) ?: 0
+
+                // A version beyond what this build knows how to migrate to means the tables were
+                // migrated by a newer release. The loop below would simply not run and report
+                // success, leaving this process reading and writing a schema it does not
+                // understand — surfacing later as malformed data or an unexpected SQLException on
+                // the hot path, far from the cause. During a rolling deployment that is the
+                // expected topology, not an edge case, so it fails here instead.
+                check(currentVersion <= targetVersion) {
+                    "${tables.messages} is at schema version $currentVersion, but this version of " +
+                        "KCPT only knows up to $targetVersion: these tables have been migrated by " +
+                        "a newer release and cannot be used by this one"
+                }
+
+                while (currentVersion < targetVersion) {
+                    mqMigrations[currentVersion].forEach { sql ->
+                        prepareStatement(sql(tables).trimIndent()).use { it.execute() }
+                    }
+                    ++currentVersion
+                    setProperty(messageQueueSchemaVersion, currentVersion)
+                }
+            }
+        }
+    }
+}
