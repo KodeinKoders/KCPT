@@ -15,11 +15,13 @@ import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
 
@@ -317,6 +319,82 @@ class MessageProcessTest : AbstractPgsqlTest() {
 
             assertEquals("parent", fromOf(parent.prefix, parentMessage.id))
             assertEquals("work", fromOf(work.prefix, workMessage.id))
+        }
+    }
+
+    // The two configurations that would let a handler outlive its own lease — and so have the same
+    // message silently processed twice, on two consumers, with nothing reporting it — are refused up
+    // front rather than left to be discovered in production.
+    @Test
+    fun aKeepaliveThatCannotOutpaceTheLeaseIsRejected() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            f.mq.post(User(1, "A"))
+            val message = f.mq.tryReceive()!!
+
+            // Refreshes every 2 minutes, but the lease goes stale a minute (+ grace) after each
+            // stamp: between refreshes the message is reclaimable out from under the handler.
+            val failure = assertFailsWith<IllegalArgumentException> {
+                message.process(timeout = 5.minutes, keepalive = 2.minutes) { null }
+            }
+            assertTrue(
+                "lease" in (failure.message ?: ""),
+                "the message must name the lease, which is what the keepalive has to outpace: ${failure.message}",
+            )
+        }
+    }
+
+    @Test
+    fun aTimeoutOutlastingTheLeaseWithNoKeepaliveIsRejected() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            f.mq.post(User(1, "A"))
+            val message = f.mq.tryReceive()!!
+
+            // Nothing re-stamps started_at, so at processingTimeout + processingGrace the message is
+            // reclaimed while this handler still has four minutes of its timeout left to run.
+            val failure = assertFailsWith<IllegalArgumentException> {
+                message.process(timeout = 5.minutes) { null }
+            }
+            assertTrue(
+                "keepalive" in (failure.message ?: ""),
+                "the message must point at the missing keepalive: ${failure.message}",
+            )
+        }
+    }
+
+    // The mirror of the two above: a long timeout *with* a keepalive fast enough to hold the lease
+    // is the supported way to process a message for longer than processingTimeout, and must work.
+    @Test
+    fun aLongTimeoutWithAnAdequateKeepaliveIsAccepted() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            f.mq.post(User(1, "A"))
+            val message = f.mq.tryReceive()!!
+
+            message.process(timeout = 5.minutes, keepalive = 10.seconds) { null }
+
+            assertEquals(0, dataSource.countMessages(f.prefix, f.queue), "this combination is the supported one and must be accepted")
+        }
+    }
+
+    // The bound is the lease as *stamped* (expiresAt - receivedAt), not the lease as it stands right
+    // now (expiresAt - Clock.System.now()). The difference only shows once time has passed since the
+    // receive: process()'s own default timeout was computed from a now() taken a moment before the
+    // check runs, so a now()-based bound would be fractionally smaller than the default it is meant
+    // to admit, and the defaults would reject themselves.
+    @Test
+    fun theDefaultTimeoutIsStillAcceptedAfterTimeHasPassedSinceTheReceive() = runTest(timeout = 5.seconds) {
+        withContext(Dispatchers.Default) {
+            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            f.mq.post(User(1, "A"))
+            val message = f.mq.tryReceive()!!
+
+            delay(500.milliseconds) // the lease is now visibly shorter than it was at receipt
+
+            message.process { null }
+
+            assertEquals(0, dataSource.countMessages(f.prefix, f.queue))
         }
     }
 }

@@ -195,6 +195,26 @@ public suspend fun <T> Message<T>.process(
 ) {
     require(keepalive == null || keepalive < timeout) { "Keepalive must be less than message processing timeout" }
 
+    // The nominal lease this message was handed: expiresAt was stamped at receivedAt + the queue's
+    // processingTimeout. Read as a difference rather than against Clock.System.now(), because the
+    // default timeout above was itself computed from a now() a moment earlier — comparing against a
+    // fresh now() would make the default just barely fail its own check.
+    val lease = expiresAt - receivedAt
+    // A keepalive slower than the lease lets it go stale between refreshes, and another consumer
+    // reclaims the message from under a handler that is still running. Checked against the lease
+    // alone, leaving processingGrace as headroom for the refresh's own round trip.
+    require(keepalive == null || keepalive < lease) {
+        "Keepalive must be less than the message lease ($lease), but was $keepalive"
+    }
+    // Nothing re-stamps the lease without a keepalive, so a handler allowed to outlive it is
+    // *guaranteed* to still be running when another consumer reclaims the message: the same message
+    // is then processed twice, concurrently, and nothing anywhere reports it. Every other failure
+    // here surfaces somewhere; this one is silent on both sides, which is why it is refused.
+    require(keepalive != null || timeout <= lease) {
+        "timeout ($timeout) is longer than the message lease ($lease), which nothing renews: " +
+            "pass a keepalive to hold the lease, or raise the queue's processingTimeout"
+    }
+
     // failureRequeue talks to the database, so a dropped connection or an exhausted pool makes it
     // throw. Left unguarded, that exception would leave process() from inside a catch block,
     // escape workerPool's launch, and cancel the pool's scope — one message's transient blip
