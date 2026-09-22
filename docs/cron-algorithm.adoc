@@ -10,6 +10,8 @@
 A KCPMQ cron fires a *tick* every `interval`, exactly once across however many servers share the database, and keeps firing on a fixed wall-clock cadence no matter how long an individual tick takes to run.
 This document explains the two tables it uses, the loop every server runs, the safeguards that make the guarantees hold, and the corner cases that fall out of the design.
 
+It is the companion to xref:message-queue-algorithm.adoc[the message queue algorithm document], which describes the system this one borrows its lease, retry and wake-up mechanics from.
+
 toc::[]
 
 

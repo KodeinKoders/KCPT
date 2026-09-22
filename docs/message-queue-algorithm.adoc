@@ -1,0 +1,688 @@
+= KCPMQ Message Queue: how the algorithm works
+:toc: left
+:toclevels: 3
+:idprefix:
+:idseparator: -
+:icons: font
+:source-highlighter: highlight.js
+
+[.lead]
+A KCPMQ message queue hands each posted message to exactly one consumer at a time, across however many servers share the database, and takes it back if that consumer dies without saying what happened.
+This document explains the single table it uses, how posting and receiving work, what `process()` guarantees around a handler, how `workerPool` turns that into a running consumer, and the corner cases that fall out of the design.
+
+It is the companion to xref:cron-algorithm.adoc[the cron algorithm document], which describes a system built on the same primitives.
+
+toc::[]
+
+
+[[vocabulary]]
+== Vocabulary
+
+These terms are used precisely throughout this document and in the code.
+
+[cols="1,3"]
+|===
+| Term | Meaning
+
+| *Message*
+| One row in the `messages` table: a payload, plus the bookkeeping that tracks who is working on it and how often it has been tried.
+
+| *Queue*
+| A named subdivision of the table.
+Every statement filters on it, and queues share the table but never rows.
+
+| *Payload*
+| The caller's value, serialized to JSON by a `KSerializer` the caller supplies.
+The library never inspects it.
+
+| *Post*
+| To insert a message, making it available either immediately or at a stated `due` time.
+
+| *Due*
+| The instant from which a message may be delivered.
+A message posted with no `due` is due at once.
+
+| *Lease*
+| A claim on a message, recorded as `started_at`.
+While a lease is live the message is invisible to every other consumer.
+
+| *Try*
+| One delivery of a message to a consumer.
+A try that does not end in success appends one entry to `notes`.
+
+| *Notes*
+| A JSON array holding one entry per failed try.
+Its length *is* the try count — there is no separate counter column.
+
+| *Reclaim*
+| To take a message whose lease has gone stale, because the consumer holding it died or hung.
+A reclaim counts as a failed try.
+
+| *Dead-letter*
+| To give up on a message once it has accrued `maxTries` failed tries: the row is deleted and the loss is reported to the observers.
+
+| *Sink*
+| `MessageQueueSink` — the object that owns the table names, runs the schema migration once, and builds `MessageQueue` instances.
+
+| *Source*
+| `suspend () -> Connection`, the library's entire database dependency.
+Every call takes a connection, uses it, and closes it.
+
+| *Channel*
+| A PostgreSQL `LISTEN`/`NOTIFY` channel, one per queue, carrying the `due_at` of whatever just became available.
+
+| *Observer*
+| Caller-supplied `Message.Observer` callbacks told about every success, failure and undecodable payload.
+|===
+
+
+[[the-schema]]
+== The schema
+
+One table, created by ``MessageQueueSink``'s own migration chain, independently of the cron tables.
+
+[source,sql]
+----
+CREATE TABLE <prefix>messages (
+    queue VARCHAR(32) NOT NULL,
+    id UUID NOT NULL,
+    due_at TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ DEFAULT NULL,
+    payload JSON NOT NULL,
+    notes JSON NOT NULL DEFAULT '[]',
+    PRIMARY KEY(queue, id)
+)
+----
+
+A row exists for exactly as long as the message is outstanding.
+It is created by `post()` and deleted when the message succeeds or is dead-lettered — there is no archive table and no tombstone.
+
+* `queue` leads the primary key, so every per-message statement matches on `(queue, id)` and uses that index as a direct lookup.
+Matching on `id` alone would not.
+* `id` is a **UUIDv7**, which is time-ordered.
+That is what makes `ORDER BY due_at, id` deliver messages posted at the same instant in the order they were posted, without a sequence.
+* `due_at` is both the schedule and the retry clock.
+It moves forward when a message is requeued for later.
+* `started_at` is the lease: `NULL` means free, a timestamp means claimed at that moment.
+* `notes` accumulates one entry per failed try and is never reset — the array only disappears with the row.
+
+`notes` is `NOT NULL` rather than merely defaulted, and that matters for a foreign writer.
+A row inserted with an explicit column list that omits `notes` would otherwise hold SQL `NULL`, which is not the same as `'[]'`: the consumer would fetch it, fail to decode it as a JSON array, and route it down the undecodable path on every delivery until it dead-lettered.
+Declaring the column `NOT NULL` makes that insert fail at the writer instead.
+
+
+[[the-indexes]]
+=== The three indexes
+
+[source,sql]
+----
+CREATE INDEX ON <prefix>messages (queue, due_at, id);                                -- <1>
+CREATE INDEX ON <prefix>messages (queue, due_at)     WHERE started_at IS NULL;       -- <2>
+CREATE INDEX ON <prefix>messages (queue, started_at) WHERE started_at IS NOT NULL;   -- <3>
+----
+<1> Serves the selection query — the hot path, run for every single delivery.
+`queue` leads for its equality, `due_at` takes the range, and `id` completes `ORDER BY due_at, id` so the `LIMIT 1` stops at the first matching entry instead of sorting the table.
+<2> Serves the wake-up query's `min(due_at)` subquery.
+<3> Serves the wake-up query's `min(started_at)` subquery.
+
+Why the full index at <1> exists alongside the partial one at <2> is worth spelling out, because it looks redundant and is not.
+
+[IMPORTANT]
+====
+PostgreSQL uses a partial index only where the query's own predicate *implies* the index's predicate.
+The selection query filters on `started_at IS NULL OR started_at < ?` — a disjunction, which implies neither branch — so index <2> cannot serve it, and without index <1> every delivery was a sequential scan followed by a sort.
+
+The wake-up query's second subquery is the contrasting case: it carries `started_at > ?`, and a comparison against `NULL` is never true, so that predicate *does* imply `started_at IS NOT NULL` and index <3> is usable.
+====
+
+
+[[posting]]
+== Posting
+
+`post()` is one transaction containing two statements.
+
+[source,sql]
+----
+INSERT INTO <prefix>messages (queue, id, due_at, payload) VALUES (?, ?, ?, ?::json);
+SELECT pg_notify(?, ?);   -- payload: the due_at just written
+----
+
+The ordering is the point.
+PostgreSQL only delivers a `NOTIFY` when its transaction commits, so a consumer can never be woken by a notification for a row it cannot yet see.
+Every write in this library that makes a message available again — a requeue, an undecodable roll-forward — follows the same shape, for the same reason.
+
+The notification's payload is the message's `due_at`, not its id.
+A waiting consumer does not need to know *which* message arrived, only whether it arrived sooner than whatever it was already waiting for, and <<job-3-wait,the wait loop>> compares exactly that.
+
+
+[[the-receive-loop]]
+== The receive loop
+
+`receiveNext()` either returns a message or parks until one can exist.
+Each iteration does up to three things, stopping as soon as it has a message.
+
+[source,kotlin]
+.The shape of `receiveNext()`
+----
+val notifications = listenConnection.produceIn(scope)   // one subscription for the whole call
+while (true) {
+    val attempt = withContext(Dispatchers.IO) {
+        receiveNextOrNull(now)                          // job 1: select and lease
+            ?.let { return@withContext Took(it) }
+        WaitUntil(wakeUpQuery() ?: now + securityCheckTimeout)   // job 2: when could one exist?
+    }
+    when (attempt) {
+        is Took      -> return attempt.message
+        is WaitUntil -> awaitUntil(attempt.instant)     // job 3: park
+    }
+}
+----
+
+`tryReceive()` is job 1 on its own: one connection, one transaction, a message or `null`.
+It never waits and never listens.
+
+
+[[job-1-select]]
+=== Job 1 — select and lease
+
+One transaction, which returns at most one message.
+
+[source,sql]
+----
+SELECT id, payload, notes, started_at
+FROM <prefix>messages
+WHERE     queue = ?
+      AND due_at <= ?                                  -- now
+      AND (started_at IS NULL OR started_at < ?)        -- now - (processingTimeout + processingGrace)
+ORDER BY due_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+----
+
+`FOR UPDATE` locks the selected row for the rest of the transaction.
+`SKIP LOCKED` means a consumer that loses the race for a row is handed the *next* eligible one instead of blocking — which is what lets many consumers drain one queue in parallel without coordinating.
+
+The `started_at` disjunction is the whole lease protocol in one line: a row is eligible either because nobody holds it, or because whoever holds it has gone quiet for longer than a lease survives.
+
+What comes back is then decided in Kotlin, not in SQL:
+
+[source,kotlin]
+----
+val candidate = decode(raw) ?: { recordUndecodable(raw, now); continue }   // <1>
+
+if (candidate.startedAt == null) {                                        // <2>
+    UPDATE ... SET started_at = now
+    return message
+}
+
+val notes = candidate.notes + leaseExpiredNote                            // <3>
+if (notes.size >= maxTries) {
+    DELETE ...; commit(); observers.onFailure(...); continue              // <4>
+}
+UPDATE ... SET started_at = now, notes = notes
+return message
+----
+<1> The payload is decoded *after* the row is locked but *before* the lease is taken.
+See <<safeguard-undecodable>> for why that order is load-bearing.
+<2> The ordinary case: a free message, leased and handed over.
+<3> A non-null `started_at` that still matched the query is an expired lease.
+The previous holder died without reporting, so this counts as a failed try exactly as an explicit `failureRequeue` would.
+<4> A reclaim can be the try that exhausts `maxTries`, in which case the message is dead-lettered here, at selection time, and the loop ``continue``s to look at the next row.
+
+Note that `maxTries` is enforced in Kotlin, against the decoded array's length, rather than as a `json_array_length(notes) < ?` predicate in the query.
+The selection query therefore returns rows that are already exhausted, and <4> is where they are recognised and cleared.
+
+
+[[job-2-wake-up]]
+=== Job 2 — work out when a message could next exist
+
+Reached only when job 1 found nothing.
+The answer is the earlier of two future events, computed in one round trip.
+
+[source,sql]
+----
+SELECT LEAST(
+    (SELECT min(due_at)     FROM <prefix>messages
+      WHERE queue = ? AND started_at IS NULL     AND due_at > ?),          -- <1>
+    (SELECT min(started_at) FROM <prefix>messages
+      WHERE queue = ? AND started_at IS NOT NULL AND started_at > ?)       -- <2>
+      + ?::interval
+)
+----
+<1> The next message that is scheduled but not yet due.
+`due_at > now` is strict: anything due *now* either does not exist or was skipped by job 1 as already leased, so it is covered by <2>.
+<2> The earliest live lease, plus `processingTimeout + processingGrace` — the instant it becomes reclaimable.
+
+[TIP]
+====
+`LEAST` ignores `NULL` arguments in PostgreSQL, so an empty subquery simply drops out of the comparison rather than poisoning the result.
+That is what lets one query cover all four combinations — messages pending, leases live, both, or neither — without any branching.
+====
+
+If both subqueries are empty the queue holds nothing at all, and the deadline becomes `now + securityCheckTimeout`.
+That timer is the backstop described in <<safeguard-security-check>>.
+
+
+[[job-3-wait]]
+=== Job 3 — wait
+
+[source,kotlin]
+----
+while (Clock.System.now() < next) {
+    val notification = withTimeoutOrNull(next - Clock.System.now()) { notifications.receive() }
+    if (notification != null && notification < next) next = notification
+}
+----
+
+The loop parks until the deadline, but a notification can bring the deadline *forward* — and only forward.
+A notification carrying a `due_at` later than what this consumer is already waiting for changes nothing, so a queue full of far-future scheduled messages does not wake every consumer on every post.
+
+Two details keep this correct:
+
+* **The wait is not on `Dispatchers.IO`.**
+Only job 1 and job 2 run there.
+Parking on an IO thread would hold one for as long as each idle consumer waits, and idle consumers are the common case.
+* **One subscription spans the whole call**, opened before any database work.
+This is the subtlest part of the loop, and <<safeguard-one-subscription>> explains what goes wrong without it.
+
+
+[[processing]]
+== Processing a message
+
+A leased message is a resource with a deadline.
+`process()` is the wrapper that runs the caller's handler against it and guarantees the row is written back exactly once, whatever the handler does.
+
+[source,kotlin]
+----
+coroutineScope {
+    try {
+        withTimeout(timeout) {
+            val keepAliveJob = keepalive?.let {
+                launch(Dispatchers.Unconfined) { while (true) { delay(it); extend() } }
+            }
+            val notes = process(message)
+            successDelete(notes ?: JsonNull)
+            keepAliveJob?.cancelAndJoin()
+        }
+    } catch (_: TimeoutCancellationException) { requeue(Timeout(timeout)) }
+    catch (_: CancellationException)          { val fromWork = isActive
+                                                requeue(Cancellation(fromWork))
+                                                ensureActive() }
+    catch (t: Throwable)                      { requeue(Exception(t)) }
+}
+----
+
+There are exactly three write-backs, and every path reaches one of them.
+
+[cols="1,3"]
+|===
+| Write-back | When
+
+| `successDelete`
+| The handler returned.
+The row is deleted and `onSuccess` fires.
+
+| `failureRequeue`
+| The handler failed and tries remain.
+`started_at` is cleared, the note is appended, `due_at` is reset, and the channel is notified — the message is immediately available to anyone.
+
+| `failureDelete`
+| The handler failed and that was try `maxTries`.
+The row is deleted and `onFailure` fires.
+|===
+
+`failureRequeue` chooses between itself and `failureDelete` by checking the array length it is about to write, so the caller never has to count tries.
+
+
+[[cancellation]]
+=== Three ways to be cancelled
+
+`withTimeout` raises `CancellationException` for reasons that must not be treated alike, and separating them is most of ``process()``'s subtlety.
+
+. **The handler outran `timeout`.**
+Arrives as `TimeoutCancellationException`, a subtype caught first.
+Recorded as a timeout failure; `process()` returns normally.
+. **The caller's coroutine was cancelled.**
+The exception belongs to the caller and must keep travelling, so the failure is recorded and then `ensureActive()` re-raises it.
+. **The handler threw a `CancellationException` of its own** — it awaited something from an unrelated, already-cancelled coroutine.
+This coroutine is *not* cancelled, so `ensureActive()` is a no-op and `process()` returns normally, treating it as an ordinary failure.
+
+Cases 2 and 3 are told apart by reading `isActive` **before** entering `NonCancellable`:
+
+[WARNING]
+====
+`NonCancellable` is an always-active `Job` that shadows the enclosing one.
+Reading `isActive` from inside it always returns `true`, which would report every foreign cancellation as a caller cancellation.
+The read happens first, and its result is carried into the write-back.
+====
+
+
+[[the-worker-pool]]
+== The worker pool
+
+`workerPool` is the whole consumer loop: receive, dispatch, repeat, forever.
+It returns `Nothing` — it ends only by cancellation or by a receive that fails.
+
+[source,kotlin]
+----
+newFixedThreadPoolContext(numberOfThreads, "KCPMQ-WorkerPool").use { dispatcher ->
+    val semaphore = Semaphore(numberOfWorkers)
+    coroutineScope {
+        receiver(this).use { receiver ->
+            while (true) {
+                semaphore.acquire()                                  // <1>
+                val message = try { receiver.receiveNext() }
+                              catch (e: Throwable) { semaphore.release(); throw e }
+                launch(dispatcher) {                                 // <2>
+                    try { message.process(timeout, keepalive, ...) }
+                    finally { semaphore.release() }
+                }
+            }
+        }
+    }
+}
+----
+<1> The permit is taken **before** the message.
+<2> Processing is dispatched to the pool's own threads; the loop returns to <1> immediately.
+
+The acquire-then-receive order is the back-pressure, and it is deliberate:
+
+[IMPORTANT]
+====
+A message's lease starts the moment `receiveNextOrNull` stamps `started_at`, not when a worker picks it up.
+Receiving first and then queueing for a free worker would burn lease time while the message sat in memory — with a saturated pool, potentially all of it, so messages would time out having never been looked at.
+
+Taking the permit first means a message is only ever leased when there is already a thread free to work it.
+====
+
+One `Receiver` is opened for the entire run, so the pool pays for a single listening connection rather than one per message.
+`numberOfWorkers` defaults to four times `numberOfThreads`, on the assumption that handlers spend most of their time suspended on I/O rather than computing.
+
+
+[[worked-example]]
+== A worked example
+
+A queue with `processingTimeout = 1m` (so `processingGrace = 12s`) and `maxTries = 5`, served by three servers, each running a `workerPool`.
+
+[cols="1,4"]
+|===
+| Time | What happens
+
+| `T0`
+| A producer calls `post(v)`.
+The row lands with `due_at = T0`, `started_at = NULL`, `notes = []`, and the commit releases a notification carrying `T0`.
+
+| `T0`
+| All three servers are parked in job 3 on a `securityCheckTimeout` deadline.
+All three wake.
+
+| `T0+1ms`
+| All three run job 1 concurrently.
+One wins the `FOR UPDATE`; the other two are handed no row by `SKIP LOCKED`, fall through to job 2, find the queue empty of anything eligible, and park again.
+
+| `T0+1ms`
+| The winner stamps `started_at = T0+1ms` and commits.
+The message is now invisible to the other two until `T0+1m12s`.
+
+| `T0+2ms`
+| `workerPool` dispatches it.
+`process()` runs the handler with a `timeout` of `expiresAt - now` — just under a minute, the lease minus what the handover already cost.
+|===
+
+From here, four endings:
+
+Handler returns:: `successDelete` removes the row and fires `onSuccess`.
+Done in one try.
+
+Handler throws at `T0+5s`:: `failureRequeue` writes `notes = [{cause: exception, …}]`, clears `started_at`, sets `due_at = T0+5s` and notifies.
+Whichever server wakes first takes try 2 immediately.
+
+Handler hangs:: at `T0+1m` ``process()``'s own `withTimeout` fires, `failureRequeue` writes a `timeout` note and releases the lease.
+The other servers were parked on `T0+1m12s`, so the requeue's notification reaches them a full 12 seconds before they would have reclaimed it — the grace margin was never needed.
+
+Server is killed at `T0+30s`:: nothing writes anything.
+The other two are parked on exactly `T0+1m12s`, computed from ``started_at``'s `min` in job 2.
+At that instant one of them reclaims it, appends `{cause: leaseExpired}` as try 1, and runs it as try 2.
+
+After five such failures the sixth selection finds `notes.size >= 5`, deletes the row and fires `onFailure`.
+
+
+[[safeguards]]
+== Safeguards
+
+Each of these exists because its absence produced a specific, observed failure.
+
+
+[[safeguard-one-consumer]]
+=== One consumer per message
+
+`FOR UPDATE SKIP LOCKED` serialises selection, and the lease stamp written in the same transaction keeps the message invisible afterwards.
+No consumer ever waits on another's row lock: it is handed a different row, or none.
+
+
+[[safeguard-grace]]
+=== The grace margin
+
+`processingGrace` is added to `processingTimeout` before a lease may be reclaimed, so a holder's own `withTimeout` always fires — and requeues the message itself — before anyone else may take it.
+Without the margin the two deadlines coincide and a reclaim races an in-flight requeue.
+
+Its floor, `MIN_PROCESSING_GRACE = 200ms`, covers a specific handover:
+
+[CAUTION]
+====
+The lease starts when job 1 stamps it, but the message still has to travel back out of `receive()` — which waits for its listening connection to be torn down, bounded by ``PGChannel``'s 50ms notification poll — and the worker still has to be dispatched.
+If the margin does not cover that handover, the message is reclaimed and processed a second time while its first worker is still going on to succeed.
+
+Nothing fails when that happens, so it is invisible: the work is simply done twice.
+An earlier 500ms poll interval consumed the whole margin of a short-timeout queue and did exactly this.
+====
+
+
+[[safeguard-keepalive]]
+=== Keepalive, and the bound on `timeout`
+
+`timeout` bounds the handler; `processingTimeout` bounds the lease.
+They are deliberately separate, because a handler that legitimately runs longer than a lease needs the lease refreshed underneath it — which is what passing `keepalive` does, re-stamping `started_at` on that cadence for as long as the handler runs.
+
+Getting the pairing wrong is silent on both sides: the message is simply processed twice, on two servers, with nothing reporting it.
+So `process()` refuses the two configurations that cause it.
+
+[source,kotlin]
+----
+val lease = expiresAt - receivedAt
+require(keepalive == null || keepalive < lease) { ... }        // <1>
+require(keepalive != null || timeout <= lease)  { ... }        // <2>
+----
+<1> A keepalive slower than the lease lets it go stale between refreshes.
+Checked against the lease alone, leaving `processingGrace` as headroom for the refresh's own round trip.
+<2> Without a keepalive nothing re-stamps the lease at all, so a handler allowed to outlive it is *guaranteed* to still be running at the reclaim.
+
+The bound is read as `expiresAt - receivedAt` — the lease *as stamped* — and not as `expiresAt - now()`.
+That is not cosmetic: ``process()``'s default `timeout` is itself computed from a `now()` taken microseconds earlier, so a `now()`-based bound is always fractionally smaller than the default it must admit, and plain `process { }` would throw every time.
+
+`workerPool` additionally derives a keepalive for you when `timeout > processingTimeout`, so the pool's defaults satisfy both checks without the caller thinking about it.
+
+
+[[safeguard-undecodable]]
+=== An undecodable payload is rolled forward, not dropped
+
+Decoding happens after the row is locked but before the lease is taken, and a failure is recorded as a failed try rather than thrown out of the transaction.
+
+[CAUTION]
+====
+Throwing would roll the transaction back untouched.
+The row would stay first in line, be selected again on the very next attempt, and wedge the entire queue behind it forever.
+====
+
+Instead the note is appended and `due_at` is pushed out by `processingTimeout`, so retries are spread over time rather than burnt through in a tight loop.
+Rolling forward rather than dropping is the right default because the usual cause is a consumer deployed behind its producer — and that fixes itself the moment the consumer is upgraded, so long as the message is still there.
+After `maxTries` it dead-letters through `onUndecodable`, which is handed the raw JSON, since there is no `T` to report.
+
+
+[[safeguard-one-subscription]]
+=== One subscription for the whole call
+
+Notifications are shared through a `SharedFlow` with no replay, which drops whatever it emits while nothing is collecting.
+
+[WARNING]
+====
+A wait loop that resubscribes per notification is deaf for the whole of each database round trip between them.
+A message posted in that window was discoverable only by the security timer — minutes later.
+====
+
+`receiveNext()` opens one subscription before any database work and holds it for the entire call, so anything arriving while jobs 1 and 2 are in flight is buffered rather than lost.
+This is also what closes the gap between job 1 finding nothing and job 2 computing a deadline: a message posted between those two statements is not seen by either, but its notification is already buffered and breaks the wait immediately.
+
+
+[[safeguard-one-connection]]
+=== One listening connection per receiver
+
+A `Receiver` opens its listening connection once and shares it across every `receiveNext()` made through it.
+`receive()` is the convenience wrapper that opens one, takes a single message, and closes it — correct, but one `LISTEN` and one teardown per message, which is why `workerPool` holds a `Receiver` for its whole run instead.
+
+The connection's owning `Job` is parented to the scope handed to `receiver(scope)`, not to the coroutine that opens it.
+A job parented to the opening coroutine can never let that coroutine complete, since it waits on a child that runs forever.
+
+
+[[safeguard-write-back-survives]]
+=== Write-back survives cancellation
+
+Every failure write-back runs under `NonCancellable`, so a cancelled caller still releases its lease rather than leaving the message stranded until the reclaim timer.
+The caller's cancellation is re-raised afterwards, from the scope's own `Job`.
+
+
+[[safeguard-contained-requeue]]
+=== A failing requeue cannot kill the pool
+
+`failureRequeue` talks to the database, so a dropped connection or an exhausted pool makes it throw — from inside a `catch` block, out of `process()`, out of ``workerPool``'s `launch`, cancelling the pool's whole scope.
+One message's transient blip would abort every other message in flight.
+
+It is contained instead, and reported through `onRequeueFailure`.
+Nothing is lost by containing it: the `UPDATE` that would have cleared `started_at` is the one that failed, so the lease stands and the row stays invisible until it expires, at which point the reclaim path counts the try exactly as this requeue would have.
+The only cost is that redelivery waits for `processingTimeout + processingGrace` instead of happening now.
+
+
+[[safeguard-observers]]
+=== Callbacks cannot break the loop
+
+Observers are caller-supplied code sitting on the acknowledgement path, after the row has already been written.
+`notifyEach` contains anything they throw, `CancellationException` included — these callbacks are not `suspend`, so they cannot legitimately take part in cancellation.
+
+[CAUTION]
+====
+An observer that threw out of `successDelete` would be indistinguishable from a processing failure, and `process()` would go on to requeue a message it had just deleted — reporting the same message as both a success and a failure.
+====
+
+`onRequeueFailure` is guarded in turn, since a throw from it would reopen <<safeguard-contained-requeue>> by another route.
+
+
+[[safeguard-security-check]]
+=== The security check timer
+
+When nothing is pending and nothing is leased, a consumer parks for `securityCheckTimeout` (10 minutes by default) rather than indefinitely.
+
+Nothing in this library's own writes needs it — every one of them notifies.
+It exists for what the library does not control: a notification lost to a dropped listening connection, or a foreign writer that ``INSERT``s into the table without calling `pg_notify`.
+It bounds how long such a message can sit unnoticed.
+
+
+[[safeguard-schema-lock]]
+=== Schema initialisation is exclusive
+
+Reading the schema version and acting on it is a check-then-act across sessions, so it runs under a database-wide advisory lock keyed on the messages table name.
+Without it, two processes starting together both read version 0 and both run the migration, and the loser fails on an already-created table — `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent creator either.
+
+A version *beyond* what the running build knows is a hard failure rather than a no-op, because during a rolling deployment that is the expected topology.
+Continuing would leave the process reading and writing a schema it does not understand, surfacing much later as malformed data on the hot path.
+
+
+[[corner-cases]]
+== Corner cases
+
+
+[[corner-fifo]]
+=== Delivery is FIFO-ordered, but not FIFO-guaranteed
+
+`ORDER BY due_at, id` with time-ordered UUIDs means each consumer takes the oldest eligible message.
+`SKIP LOCKED` then breaks strict ordering by design: a consumer that finds the oldest message locked takes the second-oldest rather than waiting.
+
+Under concurrency, messages are therefore delivered in *approximately* posted order, and completed in no particular order at all.
+Anything needing strict sequencing needs one consumer, or ordering the handler enforces itself.
+
+
+[[corner-dead-letter-notes]]
+=== The note history is gone by the time you are told
+
+`onFailure` is handed the single note from the try that exhausted `maxTries` — not the accumulated array.
+The row carrying that array is deleted in the same breath.
+
+Anything needing the full history must read `message.notes` from inside the handler, while the row still exists, or accumulate it across the `onFailure` calls of every try.
+
+
+[[corner-reclaim-try]]
+=== A reclaim consumes a try
+
+A server killed mid-handler costs the message one of its `maxTries`, recorded as `{cause: leaseExpired}`.
+Five restarts during a deployment can therefore dead-letter a message that never once failed on its own merits.
+
+Raise `maxTries` if the deployment cadence makes that likely, but do not raise it to compensate for handlers that routinely outlive their lease — that is <<safeguard-keepalive>>'s problem, and the fix there is a keepalive.
+
+
+[[corner-future-due]]
+=== A message posted for the future
+
+`post(v, due = T)` is a schedule, not a delay queue with its own machinery: the row is simply invisible to job 1 until `due_at <= now`, and job 2's first subquery is what parks consumers on exactly `T`.
+
+The notification still fires at post time, carrying `T`.
+Consumers already waiting on something earlier ignore it; consumers waiting on something later — or on the security timer — bring their deadline forward to `T`.
+
+
+[[corner-clock-skew]]
+=== Every deadline is the client's clock
+
+`now` is taken with `Clock.System.now()` on the consumer, not with PostgreSQL's `now()`.
+Leases, due dates and reclaim deadlines are therefore all measured against whichever server happens to be evaluating them.
+
+A server whose clock runs fast will reclaim leases early; one running slow will hold them past their nominal expiry.
+Both stay safe as long as skew across the fleet is well under `processingGrace`, which on a fleet with working NTP it is.
+This is a genuine assumption, not an accident, and it is the reason `processingGrace` has a floor rather than being allowed to shrink to nothing.
+
+
+[[corner-undecodable-notification]]
+=== A notification that cannot be decoded
+
+The channel payload is a serialized `Instant`.
+One that fails to decode is dropped and reported through `onUndecodableNotification`.
+
+Dropping is safe — a notification is only ever a hint that work may be available, and the security timer bounds the delay — but it is reported, because otherwise nothing in the process would say that a producer is writing a format these consumers cannot read.
+
+
+[[corner-long-name]]
+=== Queue and table names
+
+A queue name is validated to 1..32 characters at construction, matching the `VARCHAR(32)` column.
+Without that check a longer name is accepted and fails only at the first `post()`, as a driver-level "value too long" that never mentions which queue.
+
+Table names are validated as optionally-qualified identifiers rather than escaped, because they are interpolated as identifiers and no escaping function makes that safe after the fact: `escapeIdentifier` would quote `public.mq_messages` into a single identifier in the current schema, breaking the qualification.
+
+
+[[guarantees]]
+== Guarantees and non-guarantees
+
+The queue guarantees:
+
+* Each message is held by at most one consumer at a time.
+* A message is delivered at least once, and retried until it succeeds or reaches `maxTries`.
+* A crashed consumer's message is redelivered within `processingTimeout + processingGrace`.
+* A permanently failing message is given up on after `maxTries` and reported, rather than retried forever.
+* A consumer learns about a newly available message as soon as its transaction commits, not on a poll interval.
+
+The queue does *not* guarantee:
+
+* *Exactly-once processing.*
+If a handler succeeds but the `DELETE` recording it fails, the lease eventually expires and the message is delivered again.
+Handlers should be idempotent.
+* *Strict FIFO delivery*, as described in <<corner-fifo>>.
+* *Any ordering of completion.* Concurrent workers finish in whatever order their handlers do.
+* *That `maxTries` counts only handler failures*, as described in <<corner-reclaim-try>>.
+* *Correctness under large clock skew*, as described in <<corner-clock-skew>>.
