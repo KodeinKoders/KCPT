@@ -18,7 +18,6 @@ import net.kodein.kcpt.rawNotify
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
@@ -97,34 +96,6 @@ class WorkerPoolTest : AbstractPgsqlTest() {
             assertTrue(poolJob.isActive, "the pool must survive a notification it cannot decode")
 
             poolJob.cancelAndJoin()
-        }
-    }
-
-    @Test
-    fun workerPoolRejectsKeepaliveNotLessThanTreatmentTimeout() = runTest(timeout = 5.seconds) {
-        withContext(Dispatchers.Default) {
-            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
-                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 1.seconds))
-
-            assertFailsWith<IllegalArgumentException> {
-                q.workerPool(keepalive = 1.seconds) { null }
-            }
-        }
-    }
-
-    // The pool passes its own timeout down to process(), which applies the same bound again. When
-    // that timeout is shorter than the queue's processingTimeout, checking only against the queue's
-    // let a keepalive through here and threw from inside a launched worker instead — after a message
-    // had been received and leased, and fatally, since that exception cancels the pool's scope.
-    @Test
-    fun workerPoolRejectsKeepaliveNotLessThanItsOwnShorterTimeout() = runTest(timeout = 5.seconds) {
-        withContext(Dispatchers.Default) {
-            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = uniquePrefix())
-                .messageQueue(uniqueQueueName(), User.serializer(), MessageQueue.Config(processingTimeout = 60.seconds))
-
-            assertFailsWith<IllegalArgumentException> {
-                q.workerPool(timeout = 30.seconds, keepalive = 45.seconds) { null }
-            }
         }
     }
 
@@ -323,7 +294,8 @@ class WorkerPoolTest : AbstractPgsqlTest() {
         }
     }
 
-    // The path where a keepalive genuinely is needed: an explicit timeout longer than the lease.
+    // The path where a keepalive genuinely is needed: a timeout longer than the lease. Automatic
+    // now — no keepalive argument to pass — since timeout (3x) exceeds processingTimeout here.
     @Test
     fun keepaliveIsActiveWhenWorkTimeoutExceedsTreatmentTimeout() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
@@ -336,7 +308,7 @@ class WorkerPoolTest : AbstractPgsqlTest() {
 
             var messageId: kotlin.uuid.Uuid? = null
             val poolJob = launch {
-                q.workerPool(timeout = treatmentTimeout * 3, keepalive = treatmentTimeout / 3) { message ->
+                q.workerPool(timeout = treatmentTimeout * 3) { message ->
                     messageId = message.id
                     delay(2500.milliseconds) // longer than treatmentTimeout, shorter than workTimeout
                     null

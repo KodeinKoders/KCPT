@@ -37,6 +37,10 @@ public interface Message<T> {
     public val payload: T
     public val receivedAt: Instant
     public val expiresAt: Instant
+    // The queue's own reclaim margin, exposed so process() can tell whether the delay between
+    // receiving this message and actually starting to work it has already eaten into it — see
+    // process()'s own keepalive condition.
+    public val processingGrace: Duration
     public val notes: List<JsonElement>
     public suspend fun successDelete(notes: JsonElement = JsonNull)
     public suspend fun failureDelete(notes: JsonElement = JsonNull)
@@ -89,14 +93,18 @@ internal class MessageImpl<T>(
 ) : Message<T> {
 
     // extend() writes this from Dispatchers.IO while the worker reads it from wherever it is
-    // running — process()'s default timeout is derived from it, and it is public API besides. With
-    // a keepalive configured the two run concurrently for the whole of the work, and nothing else
-    // establishes a happens-before edge between them, so without @Volatile a reader can go on
-    // seeing an indefinitely stale deadline. The value is only ever written whole, never
-    // compound-updated, so volatile is enough.
+    // running — process()'s default timeout is derived from it, and it is public API besides. When
+    // process()'s automatic keepalive is active, the two run concurrently for the whole of the
+    // work, and nothing else establishes a happens-before edge between them, so without @Volatile a
+    // reader can go on seeing an indefinitely stale deadline. The value is only ever written whole,
+    // never compound-updated, so volatile is enough.
     @Volatile
     override var expiresAt: Instant = receivedAt + mqConfig.processingTimeout
         private set
+
+    // A plain read-through: mqConfig never changes after construction, so this needs neither its
+    // own field nor @Volatile.
+    override val processingGrace: Duration get() = mqConfig.processingGrace
 
     // Source only moves connection *acquisition* to Dispatchers.IO, so without this the blocking
     // statement would run on whichever dispatcher the caller is on: a core-count-limited pool it
@@ -192,33 +200,41 @@ public sealed class MessageProcessingFailure {
     }
 }
 
+// The fraction of the remaining lease process()'s automatic keepalive waits before its next
+// extend(). Chosen so the cycle self-stabilizes with a comfortable margin: since extend() always
+// resets the lease to a fresh processingTimeout, this converges to processingTimeout * 0.65 after
+// the first cycle, leaving 35% of processingTimeout as headroom before the next scheduled extend()
+// — well clear of a reclaim, which only fires after processingTimeout + processingGrace has passed
+// since the last stamp.
+private const val KEEPALIVE_LEASE_FRACTION = 0.65
+
 public suspend fun <T> Message<T>.process(
     timeout: Duration = this.expiresAt - Clock.System.now(),
-    keepalive: Duration? = null,
     onFailure: (failure: MessageProcessingFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
     onRequeueFailure: (message: Message<T>, failure: MessageProcessingFailure, cause: Throwable) -> Unit = { _, _, _ -> },
     process: suspend (Message<T>) -> JsonElement?
 ) {
-    require(keepalive == null || keepalive < timeout) { "Keepalive must be less than message processing timeout" }
-
     // The nominal lease this message was handed: expiresAt was stamped at receivedAt + the queue's
     // processingTimeout. Read as a difference rather than against Clock.System.now(), because the
     // default timeout above was itself computed from a now() a moment earlier — comparing against a
-    // fresh now() would make the default just barely fail its own check.
+    // fresh now() would make the default just barely fail its own check. Used below purely to decide
+    // whether a keepalive is needed at all — not to validate a caller-supplied one, since there is
+    // no longer a keepalive parameter to get wrong.
     val lease = expiresAt - receivedAt
-    // A keepalive slower than the lease lets it go stale between refreshes, and another consumer
-    // reclaims the message from under a handler that is still running. Checked against the lease
-    // alone, leaving processingGrace as headroom for the refresh's own round trip.
-    require(keepalive == null || keepalive < lease) {
-        "Keepalive must be less than the message lease ($lease), but was $keepalive"
-    }
-    // Nothing re-stamps the lease without a keepalive, so a handler allowed to outlive it is
-    // *guaranteed* to still be running when another consumer reclaims the message: the same message
-    // is then processed twice, concurrently, and nothing anywhere reports it. Every other failure
-    // here surfaces somewhere; this one is silent on both sides, which is why it is refused.
-    require(keepalive != null || timeout <= lease) {
-        "timeout ($timeout) is longer than the message lease ($lease), which nothing renews: " +
-            "pass a keepalive to hold the lease, or raise the queue's processingTimeout"
+
+    // Read once, rather than separately at each point below that needs "now" — the two checks that
+    // follow reason about the same instant.
+    val now = Clock.System.now()
+
+    // A handler must never be attempted once its lease has already nominally expired: by that
+    // point the row may already be visible to another consumer's reclaim query, and running the
+    // handler here would be racing that consumer rather than genuinely holding the message. This
+    // is a sign of a delay far larger than processingGrace was ever sized to absorb — a saturated
+    // dispatcher, a paused process — not something to quietly proceed through and hope for the
+    // best.
+    check(expiresAt - now > Duration.ZERO) {
+        "This message's lease already expired before processing could start " +
+            "(expiresAt=$expiresAt, now=$now) — it may already be held by another consumer."
     }
 
     // failureRequeue talks to the database, so a dropped connection or an exhausted pool makes it
@@ -252,11 +268,29 @@ public suspend fun <T> Message<T>.process(
     coroutineScope {
         try {
             withTimeout(timeout) {
+                // Needed in either of two cases. First, when timeout asks for more time than the
+                // lease naturally covers: at timeout <= lease, the handler's own withTimeout above
+                // would otherwise always fire — and hand the message back — before the lease could
+                // go stale on its own. Second, even at timeout <= lease, when the delay between
+                // receiving this message and actually starting to work it (dispatch queueing, GC,
+                // anything else) has already eaten enough of processingGrace's own margin that
+                // finishing within timeout from *here* could still land past the reclaim threshold
+                // (expiresAt + processingGrace) — a handover slower than processingGrace was sized
+                // for, which the simple timeout/lease comparison alone can't see.
                 val keepAliveJob =
-                    if (keepalive != null) {
+                    if (timeout > lease || now + timeout > expiresAt + processingGrace) {
                         launch(Dispatchers.Unconfined) {
                             while (true) {
-                                delay(keepalive)
+                                // Recomputed every cycle from the live remaining lease, not a fixed
+                                // duration: extend() resets expiresAt to a fresh processingTimeout,
+                                // so after the first cycle this converges to a stable
+                                // processingTimeout * KEEPALIVE_LEASE_FRACTION wait, leaving
+                                // (1 - KEEPALIVE_LEASE_FRACTION) of the lease as margin before the
+                                // next scheduled extend() — comfortably ahead of a reclaim, which
+                                // only fires after the full processingTimeout + processingGrace has
+                                // passed since the last stamp.
+                                val remainingLease = expiresAt - Clock.System.now()
+                                delay(remainingLease * KEEPALIVE_LEASE_FRACTION)
                                 extend()
                             }
                         }

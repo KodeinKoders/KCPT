@@ -324,59 +324,89 @@ class MessageProcessTest : AbstractPgsqlTest() {
         }
     }
 
-    // The two configurations that would let a handler outlive its own lease — and so have the same
-    // message silently processed twice, on two consumers, with nothing reporting it — are refused up
-    // front rather than left to be discovered in production.
+    // A timeout longer than processingTimeout used to need a caller-supplied keepalive, with two
+    // ways to get the pairing wrong — both refused by a require(). There is no longer a keepalive
+    // parameter to misconfigure: process() decides for itself, from timeout and the message's own
+    // stamped lease, whether one is needed, so a long timeout on its own now just works.
     @Test
-    fun aKeepaliveThatCannotOutpaceTheLeaseIsRejected() = runTest(timeout = 5.seconds) {
+    fun aTimeoutLongerThanProcessingTimeoutKeepsTheLeaseAliveAutomatically() = runTest(timeout = 8.seconds) {
         withContext(Dispatchers.Default) {
-            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            val f = fixture(MessageQueue.Config(processingTimeout = 1.seconds))
             f.mq.post(User(1, "A"))
             val message = f.mq.tryReceive()!!
+            val before = dataSource.startedAtOf(f.prefix, message.id)
+            assertNotNull(before)
 
-            // Refreshes every 2 minutes, but the lease goes stale a minute (+ grace) after each
-            // stamp: between refreshes the message is reclaimable out from under the handler.
-            val failure = assertFailsWith<IllegalArgumentException> {
-                message.process(timeout = 5.minutes, keepalive = 2.minutes) { null }
+            val job = launch {
+                // Longer than processingTimeout, so the automatic keepalive (timeout > lease) is
+                // active; well under timeout, so it is not what ends the call.
+                message.process(timeout = 5.seconds) {
+                    delay(1500.milliseconds)
+                    null
+                }
             }
-            assertTrue(
-                "lease" in (failure.message ?: ""),
-                "the message must name the lease, which is what the keepalive has to outpace: ${failure.message}",
-            )
+
+            delay(1200.milliseconds) // past processingTimeout — reclaimable by now without a keepalive
+            val after = dataSource.startedAtOf(f.prefix, message.id)
+            assertNotNull(after)
+            assertTrue(after.isAfter(before), "the lease should have been extended automatically")
+
+            job.join()
+            assertEquals(0, dataSource.countMessages(f.prefix, f.queue), "the message should have been processed exactly once, successfully")
         }
     }
 
+    // timeout > lease alone isn't the only trigger: a handover slower than processingGrace — the
+    // delay between receiving this message and process() actually starting, exactly the gap
+    // workerPool's own acquire-then-dispatch ordering is meant to bound — can eat enough of the
+    // margin that even a *fixed* timeout equal to processingTimeout (workerPool's own default,
+    // rather than process()'s adaptive expiresAt-now() one) would otherwise run past the reclaim
+    // threshold. The keepalive must still fire in that case.
     @Test
-    fun aTimeoutOutlastingTheLeaseWithNoKeepaliveIsRejected() = runTest(timeout = 5.seconds) {
+    fun aHandoverDelayPastProcessingGraceTriggersKeepaliveEvenAtDefaultTimeout() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {
-            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            val f = fixture(MessageQueue.Config(processingTimeout = 1.seconds)) // processingGrace = 200ms
             f.mq.post(User(1, "A"))
             val message = f.mq.tryReceive()!!
 
-            // Nothing re-stamps started_at, so at processingTimeout + processingGrace the message is
-            // reclaimed while this handler still has four minutes of its timeout left to run.
-            val failure = assertFailsWith<IllegalArgumentException> {
-                message.process(timeout = 5.minutes) { null }
+            delay(900.milliseconds) // the handover delay itself, well past processingGrace
+            val before = dataSource.startedAtOf(f.prefix, message.id)
+            assertNotNull(before)
+
+            val job = launch {
+                // Fixed at processingTimeout, like workerPool's own default — not process()'s
+                // adaptive expiresAt-now() default, which would already price the delay in.
+                message.process(timeout = 1.seconds) {
+                    delay(600.milliseconds)
+                    null
+                }
             }
-            assertTrue(
-                "keepalive" in (failure.message ?: ""),
-                "the message must point at the missing keepalive: ${failure.message}",
-            )
+
+            delay(500.milliseconds) // 900+500=1400ms since receipt, past processingTimeout+processingGrace=1200ms
+            val after = dataSource.startedAtOf(f.prefix, message.id)
+            assertNotNull(after)
+            assertTrue(after.isAfter(before), "the lease should have been kept alive despite the handover delay")
+
+            job.join()
+            assertEquals(0, dataSource.countMessages(f.prefix, f.queue))
         }
     }
 
-    // The mirror of the two above: a long timeout *with* a keepalive fast enough to hold the lease
-    // is the supported way to process a message for longer than processingTimeout, and must work.
+    // A handler must never even be attempted once its lease has already nominally expired by the
+    // time process() starts — running it at that point would be racing whichever consumer may
+    // already be reclaiming the message, not genuinely holding it.
     @Test
-    fun aLongTimeoutWithAnAdequateKeepaliveIsAccepted() = runTest(timeout = 5.seconds) {
+    fun processThrowsIfTheLeaseHasAlreadyExpiredBeforeItEvenStarts() = runTest(timeout = 5.seconds) {
         withContext(Dispatchers.Default) {
-            val f = fixture(MessageQueue.Config(processingTimeout = 1.minutes))
+            val f = fixture(MessageQueue.Config(processingTimeout = 300.milliseconds))
             f.mq.post(User(1, "A"))
             val message = f.mq.tryReceive()!!
 
-            message.process(timeout = 5.minutes, keepalive = 10.seconds) { null }
+            delay(400.milliseconds) // past expiresAt already
 
-            assertEquals(0, dataSource.countMessages(f.prefix, f.queue), "this combination is the supported one and must be accepted")
+            assertFailsWith<IllegalStateException> {
+                message.process { null }
+            }
         }
     }
 

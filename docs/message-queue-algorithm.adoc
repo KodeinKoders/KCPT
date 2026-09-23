@@ -291,15 +291,27 @@ This is the subtlest part of the loop, and <<safeguard-one-subscription>> explai
 
 A leased message is a resource with a deadline.
 `process()` is the wrapper that runs the caller's handler against it and guarantees the row is written back exactly once, whatever the handler does.
+It refuses to even start once that deadline has already passed, and the `keepAliveJob` below runs whenever there's a real risk of reaching it — see <<safeguard-keepalive>> for exactly when that is and why.
 
 [source,kotlin]
 ----
+val lease = expiresAt - receivedAt
+val now = Clock.System.now()
+check(expiresAt - now > Duration.ZERO) { "..." }                          // <1>
+
 coroutineScope {
     try {
         withTimeout(timeout) {
-            val keepAliveJob = keepalive?.let {
-                launch(Dispatchers.Unconfined) { while (true) { delay(it); extend() } }
-            }
+            val keepAliveJob = if (timeout > lease ||
+                                    now + timeout > expiresAt + processingGrace) {   // <2>
+                launch(Dispatchers.Unconfined) {
+                    while (true) {
+                        val remainingLease = expiresAt - Clock.System.now()
+                        delay(remainingLease * 0.65)
+                        extend()
+                    }
+                }
+            } else null
             val notes = process(message)
             successDelete(notes ?: JsonNull)
             keepAliveJob?.cancelAndJoin()
@@ -311,6 +323,8 @@ coroutineScope {
     catch (t: Throwable)                      { requeue(Exception(t)) }
 }
 ----
+<1> See <<safeguard-stale-start>>.
+<2> See <<safeguard-keepalive>>.
 
 There are exactly three write-backs, and every path reaches one of them.
 
@@ -374,7 +388,7 @@ newFixedThreadPoolContext(numberOfThreads, "KCPT-WorkerPool").use { dispatcher -
                 val message = try { receiver.receiveNext() }
                               catch (e: Throwable) { semaphore.release(); throw e }
                 launch(dispatcher) {                                 // <2>
-                    try { message.process(timeout, keepalive, ...) }
+                    try { message.process(timeout, ...) }
                     finally { semaphore.release() }
                 }
             }
@@ -478,29 +492,56 @@ An earlier 500ms poll interval consumed the whole margin of a short-timeout queu
 ====
 
 
+[[safeguard-stale-start]]
+=== Refusing to start on an already-expired lease
+
+The grace margin above covers an *ordinary* handover.
+If the delay between receiving a message and actually starting to work it somehow runs long enough that the lease has expired before `process()` even begins — a catastrophically saturated dispatcher, a paused process, anything far beyond what `processingGrace` was sized for — running the handler at that point would mean racing whichever consumer may already be reclaiming the row, not genuinely holding it.
+
+`process()` refuses outright rather than proceeding on faith:
+
+[source,kotlin]
+----
+check(expiresAt - now > Duration.ZERO) { "..." }
+----
+
+This runs once, before anything else, using the same `now()` the keepalive decision below reasons from.
+It throws `IllegalStateException` — this is a state the message was found in, not an argument the caller passed — and nothing catches it inside `process()`, so it propagates straight out.
+
+
 [[safeguard-keepalive]]
-=== Keepalive, and the bound on `timeout`
+=== Keepalive
 
 `timeout` bounds the handler; `processingTimeout` bounds the lease.
-They are deliberately separate, because a handler that legitimately runs longer than a lease needs the lease refreshed underneath it — which is what passing `keepalive` does, re-stamping `started_at` on that cadence for as long as the handler runs.
+They are deliberately separate, because a handler that legitimately runs longer than a lease needs the lease refreshed underneath it.
 
-Getting the pairing wrong is silent on both sides: the message is simply processed twice, on two servers, with nothing reporting it.
-So `process()` refuses the two configurations that cause it.
+That refresh is not something a caller configures.
+`process()` decides for itself whether one is needed at all — and if so, runs it for exactly as long as the handler does:
 
 [source,kotlin]
 ----
 val lease = expiresAt - receivedAt
-require(keepalive == null || keepalive < lease) { ... }        // <1>
-require(keepalive != null || timeout <= lease)  { ... }        // <2>
+val keepAliveJob = if (timeout > lease ||                                 // <1>
+                        now + timeout > expiresAt + processingGrace) {    // <2>
+    launch(Dispatchers.Unconfined) {
+        while (true) {
+            val remainingLease = expiresAt - Clock.System.now()
+            delay(remainingLease * 0.65)                                  // <3>
+            extend()
+        }
+    }
+} else null
 ----
-<1> A keepalive slower than the lease lets it go stale between refreshes.
-Checked against the lease alone, leaving `processingGrace` as headroom for the refresh's own round trip.
-<2> Without a keepalive nothing re-stamps the lease at all, so a handler allowed to outlive it is *guaranteed* to still be running at the reclaim.
+<1> At `timeout <= lease`, the handler's own `withTimeout` would, on its own, always fire — and hand the message back — before the lease could go stale on its own.
+The comparison uses the lease *as stamped* (`expiresAt - receivedAt`), not a live `expiresAt - now()` reading: ``process()``'s default `timeout` is itself computed from a `now()` taken microseconds earlier, so a `now()`-based comparison here would make the default just barely fail its own check.
+<2> But condition 1 alone assumes `process()` starts running the moment the lease is taken.
+It doesn't always: `now` here is read when `process()` actually starts, and if the handover since `receivedAt` has already eaten into ``processingGrace``'s own margin, finishing `timeout` after *that* point can still land past the reclaim threshold (`expiresAt + processingGrace`) even though `timeout` never exceeded the lease itself.
+A *fixed* `timeout` — ``workerPool``'s own default is `config.processingTimeout`, a constant, not ``process()``'s adaptive `expiresAt - now()` one — is exactly what exposes this: it doesn't shrink to account for a slow handover the way the adaptive default does.
+<3> Recomputed every cycle from the *live* remaining lease, not fixed once.
+`extend()` resets `expiresAt` to a fresh `processingTimeout`, so after the first cycle this converges to a stable `processingTimeout * 0.65` wait — 35% of the lease left as margin before the next scheduled `extend()`, comfortably ahead of a reclaim, which only fires once the full `processingTimeout + processingGrace` has passed since the last stamp.
 
-The bound is read as `expiresAt - receivedAt` — the lease *as stamped* — and not as `expiresAt - now()`.
-That is not cosmetic: ``process()``'s default `timeout` is itself computed from a `now()` taken microseconds earlier, so a `now()`-based bound is always fractionally smaller than the default it must admit, and plain `process { }` would throw every time.
-
-`workerPool` additionally derives a keepalive for you when `timeout > processingTimeout`, so the pool's defaults satisfy both checks without the caller thinking about it.
+This removes the one failure mode that used to be silent on both sides: a handler that could still outlive its lease — whether because `timeout` was set beyond it, or because the handover alone had already eaten the margin — with nothing configured to renew it, letting another consumer reclaim the message while the first handler was still going on to succeed.
+There is nothing left to misconfigure — a handler can ask for as much `timeout` as it needs, and the lease is kept alive for exactly that long, automatically.
 
 
 [[safeguard-undecodable]]
@@ -625,7 +666,8 @@ Anything needing the full history must read `message.notes` from inside the hand
 A server killed mid-handler costs the message one of its `maxTries`, recorded as `{cause: leaseExpired}`.
 Five restarts during a deployment can therefore dead-letter a message that never once failed on its own merits.
 
-Raise `maxTries` if the deployment cadence makes that likely, but do not raise it to compensate for handlers that routinely outlive their lease — that is <<safeguard-keepalive>>'s problem, and the fix there is a keepalive.
+Raise `maxTries` if the deployment cadence makes that likely, but there is no need to raise it to compensate for handlers that routinely need more time than `processingTimeout` allows — <<safeguard-keepalive>>'s automatic keepalive already covers that case, as long as `timeout` is set to admit it.
+A `leaseExpired` reclaim now only happens when a server has genuinely crashed or been killed, not merely because a handler was slow.
 
 
 [[corner-future-due]]
