@@ -88,12 +88,11 @@ public interface Cron {
     // once (one call per server; also possible more than once per process), not from a knob here.
     public suspend fun run(
         // Independent of tickTimeout, which only bounds how long a lease may be held before
-        // another server may reclaim it. A tick allowed to run longer than that needs a
-        // keepalive to keep renewing the lease — exactly like Message<T>.process()'s own
-        // timeout/keepalive pair — so this must be able to exceed tickTimeout. run() refuses the
-        // combination that would let a handler outlive its own lease.
+        // another server may reclaim it — so this must be able to exceed tickTimeout. A tick
+        // allowed to run longer than that has its lease kept alive automatically, for exactly as
+        // long as it runs — exactly like Message<T>.process()'s own automatic keepalive; there is
+        // no parameter here to configure or misconfigure.
         timeout: Duration = config.tickTimeout,
-        keepalive: Duration? = null,
         onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
         onFailure: (failure: CronTickFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
         onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
@@ -237,7 +236,11 @@ internal class CronImpl(
     private sealed interface LeaseOutcome {
         object NoWork : LeaseOutcome
         class DeadLettered(val from: Instant, val to: Instant, val notes: JsonArray) : LeaseOutcome
-        class Leased(val from: Instant, val to: Instant, val notes: JsonArray) : LeaseOutcome
+        // startedAt is the exact value this lease was just stamped with — the same "now" the
+        // UPDATE below wrote to started_at — so runTick can compute this tick's own nominal
+        // deadline (startedAt + tickTimeout) without a second clock read that could disagree with
+        // what the database actually holds.
+        class Leased(val from: Instant, val to: Instant, val notes: JsonArray, val startedAt: Instant) : LeaseOutcome
     }
 
     private suspend fun tryLease(): LeaseOutcome = withContext(Dispatchers.IO) {
@@ -303,7 +306,7 @@ internal class CronImpl(
             statement.setInstant(4, row.from)
             statement.executeUpdate()
         }
-        LeaseOutcome.Leased(row.from, row.to, notes)
+        LeaseOutcome.Leased(row.from, row.to, notes, now)
     }
 
     // Deletes on success — there is nothing more to track for a window once it's done, unlike a
@@ -355,10 +358,14 @@ internal class CronImpl(
         }
     }
 
-    private suspend fun extendLease(from: Instant): Unit = withContext(Dispatchers.IO) {
+    // Takes the stamp to write rather than reading its own now(): the caller (the keepalive loop)
+    // needs that exact same instant afterward, to recompute this tick's own local expiresAt —
+    // reading it once and sharing it is what keeps the two from disagreeing by however long the
+    // round trip below takes.
+    private suspend fun extendLease(from: Instant, now: Instant): Unit = withContext(Dispatchers.IO) {
         source().use { connection ->
             connection.prepareStatement("UPDATE ${tables.cronTicks} SET started_at = ? WHERE name = ? AND from_at = ?").use { statement ->
-                statement.setInstant(1, Clock.System.now())
+                statement.setInstant(1, now)
                 statement.setString(2, name)
                 statement.setInstant(3, from)
                 statement.executeUpdate()
@@ -394,34 +401,12 @@ internal class CronImpl(
 
     override suspend fun run(
         timeout: Duration,
-        keepalive: Duration?,
         onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit,
         onFailure: (failure: CronTickFailure) -> JsonElement,
         onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit,
         onError: (cause: Throwable) -> Unit,
         tick: suspend (from: Instant, to: Instant) -> JsonElement?,
     ): Nothing {
-        require(keepalive == null || keepalive < timeout) {
-            "keepalive must be less than timeout ($timeout), but was $keepalive"
-        }
-        // The lease only survives tickTimeout + tickGrace past its last stamp, so a keepalive
-        // slower than that lets it go stale between refreshes and another server reclaims the
-        // window from under a handler that is still running. Checked against tickTimeout alone,
-        // leaving tickGrace as headroom for the refresh's own round trip — the same margin
-        // workerPool leaves against processingTimeout.
-        require(keepalive == null || keepalive < config.tickTimeout) {
-            "keepalive must be less than tickTimeout (${config.tickTimeout}), but was $keepalive"
-        }
-        // Nothing re-stamps the lease without a keepalive, so a handler allowed to outlive the
-        // lease is *guaranteed* to still be running when another server reclaims its window: the
-        // same window then runs twice, concurrently, and nothing anywhere reports it. This is the
-        // one failure in this file that is silent on both sides, which is why it is refused here
-        // rather than left to the caller to notice.
-        require(keepalive != null || timeout <= config.tickTimeout + config.tickGrace) {
-            "timeout ($timeout) is longer than a lease survives without being renewed " +
-                "(tickTimeout + tickGrace = ${config.tickTimeout + config.tickGrace}): pass a " +
-                "keepalive to hold the lease, raise tickTimeout, or lower timeout"
-        }
         register()
 
         coroutineScope {
@@ -457,7 +442,7 @@ internal class CronImpl(
                             is LeaseOutcome.DeadLettered ->
                                 try { onDeadLetter(outcome.from, outcome.to, outcome.notes) } catch (_: Throwable) {}
                             is LeaseOutcome.Leased ->
-                                runTick(outcome, timeout, keepalive, onSuccess, onFailure, onDeadLetter, onError, tick)
+                                runTick(outcome, timeout, onSuccess, onFailure, onDeadLetter, onError, tick)
                             is LeaseOutcome.NoWork -> {
                                 val wakeAt = wakeUpAt()
                                 if (wakeAt == null) register() else awaitSomethingToDo(wakeAt)
@@ -485,7 +470,6 @@ internal class CronImpl(
     private suspend fun runTick(
         leased: LeaseOutcome.Leased,
         timeout: Duration,
-        keepalive: Duration?,
         onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit,
         onFailure: (failure: CronTickFailure) -> JsonElement,
         onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit,
@@ -495,6 +479,27 @@ internal class CronImpl(
         val from = leased.from
         val to = leased.to
         val priorNotes = leased.notes
+
+        // This tick's nominal deadline, as originally stamped. A local var rather than a class
+        // field — unlike Message<T>, there is no persistent per-tick object here for a keepalive
+        // to update — updated in place by the keepalive loop below after each extendLease().
+        var expiresAt = leased.startedAt + config.tickTimeout
+
+        // Read once, rather than separately at each point below that needs "now" — the two checks
+        // that follow reason about the same instant.
+        val now = Clock.System.now()
+
+        // A tick must never be attempted once its lease has already nominally expired: by that
+        // point the row may already be visible to another server's reclaim query, and running the
+        // handler here would be racing that server rather than genuinely holding the window. This
+        // is a sign of a delay far larger than tickGrace was ever sized to absorb, not something
+        // to quietly proceed through. Thrown here rather than swallowed: run()'s own outer catch
+        // still contains it — reported through onError, the loop backs off by tickGrace and
+        // continues — exactly as any other infrastructure surprise in this file already is.
+        check(expiresAt - now > Duration.ZERO) {
+            "This tick's lease already expired before processing could start " +
+                "(expiresAt=$expiresAt, now=$now) — it may already be held by another server."
+        }
 
         // failureNote is computed from onFailure, itself caller-supplied code, before entering
         // NonCancellable, matching Message<T>.process()'s onRequeueFailure guard: the write-back
@@ -511,14 +516,29 @@ internal class CronImpl(
         coroutineScope {
             try {
                 withTimeout(timeout) {
-                    val keepAliveJob = keepalive?.let {
-                        launch(Dispatchers.Unconfined) {
-                            while (true) {
-                                delay(it)
-                                extendLease(from)
+                    // Needed in either of two cases. First, when timeout asks for more time than
+                    // tickTimeout naturally covers: at timeout <= tickTimeout, the tick's own
+                    // withTimeout above would otherwise always fire — and hand the window back —
+                    // before the lease could go stale on its own. Second, even at
+                    // timeout <= tickTimeout, when the delay between leasing this tick and
+                    // actually starting to run it has already eaten enough of tickGrace's own
+                    // margin that finishing within timeout from *here* could still land past the
+                    // reclaim threshold (expiresAt + tickGrace) — a handover slower than tickGrace
+                    // was sized for, which the simple timeout/tickTimeout comparison alone can't
+                    // see. See <<safeguard-keepalive>> in the algorithm doc for the full reasoning
+                    // — this mirrors Message<T>.process()'s own automatic keepalive exactly.
+                    val keepAliveJob =
+                        if (timeout > config.tickTimeout || now + timeout > expiresAt + config.tickGrace) {
+                            launch(Dispatchers.Unconfined) {
+                                while (true) {
+                                    val remainingLease = expiresAt - Clock.System.now()
+                                    delay(remainingLease * KEEPALIVE_LEASE_FRACTION)
+                                    val extendedAt = Clock.System.now()
+                                    extendLease(from, extendedAt)
+                                    expiresAt = extendedAt + config.tickTimeout
+                                }
                             }
-                        }
-                    }
+                        } else null
                     // recordSuccess runs before onSuccess and before cancelling the keepalive job,
                     // so a throwing onSuccess cannot retroactively turn this success into a
                     // failure — the same reasoning as messages' aThrowingObserverDoesNotTurnA
@@ -545,5 +565,14 @@ internal class CronImpl(
     private companion object {
         // The width of the name column declared in CronSetup.kt's CREATE TABLE.
         const val MAX_NAME_LENGTH = 32
+
+        // The fraction of the remaining lease runTick's automatic keepalive waits before its next
+        // extendLease(). Chosen so the cycle self-stabilizes with a comfortable margin: since
+        // extendLease() always resets the lease to a fresh tickTimeout, this converges to
+        // tickTimeout * 0.65 after the first cycle, leaving 35% of tickTimeout as headroom before
+        // the next scheduled extendLease() — well clear of a reclaim, which only fires after
+        // tickTimeout + tickGrace has passed since the last stamp. The same constant, and the
+        // same reasoning, as kcpt-message-queue's Message.process().
+        const val KEEPALIVE_LEASE_FRACTION = 0.65
     }
 }

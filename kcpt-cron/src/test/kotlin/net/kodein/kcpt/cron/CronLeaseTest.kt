@@ -13,11 +13,9 @@ import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 import kotlin.time.toKotlinInstant
@@ -75,92 +73,77 @@ class CronLeaseTest : AbstractPgsqlTest() {
     }
 
     // A tick that legitimately runs longer than tickTimeout must not be stolen out from under its
-    // own holder while its keepalive is still renewing the lease.
+    // own holder while its automatic keepalive is still renewing the lease. No keepalive argument
+    // to pass anymore — timeout (2s) alone exceeds tickTimeout (400ms), which is enough for
+    // runTick to decide on its own that one is needed.
+    //
+    // Needs a second server: a single cron.run() call processes ticks one at a time, awaiting
+    // runTick before its own loop can look at anything else, so nothing in a one-server version of
+    // this test could ever re-lease the tick regardless of whether the keepalive actually ran —
+    // the assertion would hold either way. The second server is what makes "not reclaimed" an
+    // actual claim rather than a foregone conclusion.
     @Test
-    fun keepaliveProtectsALongTickFromBeingReclaimed() = runTest(timeout = 10.seconds) {
+    fun aTimeoutLongerThanTickTimeoutKeepsTheLeaseAliveAutomatically() = runTest(timeout = 10.seconds) {
         withContext(Dispatchers.Default) {
             val prefix = uniquePrefix()
             val name = uniqueQueueName()
             val config = Cron.Config(interval = 5.seconds, tickTimeout = 400.milliseconds, retries = 5)
-
-            val sink = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
             val attempts = AtomicInteger(0)
-            val cron = sink.cron(name, config, runImmediately = true)
 
-            val runner = launch {
+            suspend fun server() {
+                val sink = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                val cron = sink.cron(name, config, runImmediately = true)
                 // timeout is independent of tickTimeout — tickTimeout only bounds the lease, and
-                // a tick allowed to run longer than that needs its own, larger timeout here, with
-                // keepalive renewing the lease underneath it.
-                cron.run(timeout = 2.seconds, keepalive = 100.milliseconds) { from, to ->
+                // a tick allowed to run longer than that gets its own larger timeout here, with
+                // the lease kept alive automatically underneath it.
+                cron.run(timeout = 2.seconds) { from, to ->
                     attempts.incrementAndGet()
                     delay(1.seconds) // longer than tickTimeout, but kept alive
                     null
                 }
             }
 
-            delay(1500.milliseconds) // long past tickTimeout without the keepalive
-            runner.cancelAndJoin()
+            val runners = listOf(launch { server() }, launch { server() })
 
-            assertEquals(1, attempts.get(), "the tick must not have been reclaimed and re-run while its keepalive was active")
+            delay(1500.milliseconds) // long past tickTimeout+tickGrace without a keepalive
+            runners.forEach { it.cancelAndJoin() }
+
+            assertEquals(1, attempts.get(), "the tick must not have been reclaimed and re-run by the other server while its keepalive was active")
         }
     }
 
-    // The two configurations that would let a handler outlive its own lease — and so have the
-    // same window silently run twice, on two servers, with nothing reporting it — are refused up
-    // front rather than left to be discovered in production.
+    // A tick must never be attempted once its lease has already nominally expired by the time
+    // processing starts. There is no public seam to inject an artificial delay between leasing and
+    // running a tick the way there is for messages (tryReceive() then process() separately) — the
+    // two happen back to back inside run()'s own private loop — so an artificially tiny
+    // tickTimeout stands in for a genuinely pathological handover delay instead: an ordinary
+    // Postgres round trip between leasing and starting to run reliably exceeds 1ms on its own.
+    //
+    // The check throws inside runTick, which is exactly what run()'s own outer catch already
+    // exists to contain — reported through onError, the loop backs off by tickGrace and continues,
+    // the same as any other infrastructure surprise in this file.
     @Test
-    fun aKeepaliveThatCannotOutpaceTheLeaseIsRejected() = runTest(timeout = 10.seconds) {
+    fun aTickThatCannotStartInTimeIsReportedThroughOnError() = runTest(timeout = 10.seconds) {
         withContext(Dispatchers.Default) {
             val prefix = uniquePrefix()
-            val cron = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .cron(uniqueQueueName(), Cron.Config(interval = 10.minutes, tickTimeout = 1.minutes))
+            val name = uniqueQueueName()
+            val config = Cron.Config(interval = 100.milliseconds, tickTimeout = 1.milliseconds, retries = 5)
 
-            // Refreshes every 2 minutes, but the lease goes stale 1 minute (+ grace) after each
-            // stamp: between refreshes the window is reclaimable out from under the handler.
-            val failure = assertFailsWith<IllegalArgumentException> {
-                cron.run(timeout = 5.minutes, keepalive = 2.minutes) { _, _ -> null }
-            }
-            assertTrue(
-                "tickTimeout" in (failure.message ?: ""),
-                "the message must name tickTimeout, which is what the keepalive has to outpace: ${failure.message}",
-            )
-        }
-    }
-
-    @Test
-    fun aTimeoutOutlastingTheLeaseWithNoKeepaliveIsRejected() = runTest(timeout = 10.seconds) {
-        withContext(Dispatchers.Default) {
-            val prefix = uniquePrefix()
-            val cron = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .cron(uniqueQueueName(), Cron.Config(interval = 10.minutes, tickTimeout = 1.minutes))
-
-            // Nothing re-stamps started_at, so at tickTimeout + tickGrace the window is reclaimed
-            // while this handler still has four minutes of its timeout left to run.
-            val failure = assertFailsWith<IllegalArgumentException> {
-                cron.run(timeout = 5.minutes) { _, _ -> null }
-            }
-            assertTrue(
-                "keepalive" in (failure.message ?: ""),
-                "the message must point at the missing keepalive: ${failure.message}",
-            )
-        }
-    }
-
-    // The mirror of the two above: a long timeout *with* a keepalive fast enough to hold the
-    // lease is the supported way to run a tick longer than tickTimeout, and must not be refused.
-    @Test
-    fun aLongTimeoutWithAnAdequateKeepaliveIsAccepted() = runTest(timeout = 10.seconds) {
-        withContext(Dispatchers.Default) {
-            val prefix = uniquePrefix()
-            val cron = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
-                .cron(uniqueQueueName(), Cron.Config(interval = 10.minutes, tickTimeout = 1.minutes))
+            val sink = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
+            val cron = sink.cron(name, config, runImmediately = true)
+            val errors = CopyOnWriteArrayList<Throwable>()
 
             val runner = launch {
-                cron.run(timeout = 5.minutes, keepalive = 30.seconds) { _, _ -> null }
+                cron.run(onError = { errors += it }) { _, _ -> null }
             }
-            delay(300.milliseconds)
-            assertTrue(runner.isActive, "this combination is the supported one and must be accepted")
+
+            awaitUntil(timeout = 5.seconds) { errors.any { it is IllegalStateException } }
             runner.cancelAndJoin()
+
+            assertTrue(
+                errors.any { it is IllegalStateException && "already expired" in (it.message ?: "") },
+                "expected an IllegalStateException about an already-expired lease, got: $errors",
+            )
         }
     }
 }

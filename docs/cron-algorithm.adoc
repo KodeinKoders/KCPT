@@ -344,15 +344,32 @@ After `tickTimeout + tickGrace`, the row matches the lease query again and anoth
 `tickGrace` exists so that a holder's own `withTimeout` always fires — and writes its failure — before anyone else may take the window from under it.
 
 
+[[safeguard-stale-start]]
+=== Refusing to start on an already-expired lease
+
+The grace margin above covers an *ordinary* handover.
+If the delay between leasing a tick and actually starting to run it somehow runs long enough that the lease has expired before `runTick` even begins — a catastrophically saturated dispatcher, a paused process, anything far beyond what `tickGrace` was sized for — running the handler at that point would mean racing whichever server may already be reclaiming the row, not genuinely holding it.
+
+`runTick` refuses outright rather than proceeding on faith:
+
+[source,kotlin]
+----
+check(expiresAt - now > Duration.ZERO) { "..." }
+----
+
+This runs once, before anything else, using the same `now()` the keepalive decision below reasons from.
+It throws `IllegalStateException` — this is a state the tick was found in, not an argument the caller passed — and unlike ``Message<T>.process()``, where this same check propagates straight to the caller, here it lands inside ``run()``'s own outer `try`/`catch`: reported through `onError`, the loop backs off by `tickGrace` and continues, the same as any other infrastructure surprise in this file (see <<safeguard-infrastructure>>).
+
+
 [[safeguard-keepalive]]
 === Keepalive
 
 `timeout` bounds the handler; `tickTimeout` bounds the lease.
 They are deliberately separate, because a tick that legitimately runs longer than a lease needs the lease refreshed underneath it.
-Passing `keepalive` launches a coroutine that re-stamps `started_at` on that cadence for as long as the handler runs.
 
-Because getting this pairing wrong is silent on both sides — the window simply runs twice, on two servers, with nothing reporting it — `run` refuses the combinations that would allow it rather than letting them be discovered in production.
-See <<corner-timeout-above-lease>>.
+That refresh is not something a caller configures.
+`runTick` decides for itself whether one is needed at all — and if so, runs it for exactly as long as the handler does, exactly mirroring ``Message<T>.process()``'s own automatic keepalive.
+See <<corner-timeout-above-lease>> for the two conditions that trigger it.
 
 
 [[safeguard-retries]]
@@ -455,22 +472,31 @@ With too few, the backlog grows and ticks fall behind — and if it grows past `
 [[corner-timeout-above-lease]]
 === Running a handler for longer than its lease
 
-`timeout` bounds the handler and `tickTimeout` bounds the lease, so raising the first above the second opens a window in which the lease goes stale while the handler is still working — another server reclaims it, and the same window runs twice, concurrently, with nothing anywhere reporting it.
+`timeout` bounds the handler and `tickTimeout` bounds the lease, so raising the first above the second opens a window in which the lease could go stale while the handler is still working — another server reclaims it, and the same window runs twice, concurrently, with nothing anywhere reporting it.
 
-This is the only failure in the design that is silent on both sides, so `Cron.run` refuses the two configurations that cause it:
+This is the only failure in the design that is silent on both sides, so `runTick` protects against it automatically rather than asking the caller to configure a keepalive correctly:
 
 [source,kotlin]
 ----
-require(keepalive == null || keepalive < config.tickTimeout) { ... }              // <1>
-require(keepalive != null || timeout <= config.tickTimeout + config.tickGrace) { ... }  // <2>
+val keepAliveJob = if (timeout > config.tickTimeout ||                          // <1>
+                        now + timeout > expiresAt + config.tickGrace) {         // <2>
+    launch(Dispatchers.Unconfined) {
+        while (true) {
+            val remainingLease = expiresAt - Clock.System.now()
+            delay(remainingLease * 0.65)                                       // <3>
+            extendLease(from, Clock.System.now())
+        }
+    }
+} else null
 ----
-<1> A keepalive slower than `tickTimeout` lets the lease go stale between refreshes.
-It is checked against `tickTimeout` alone rather than `tickTimeout + tickGrace`, leaving the grace period as headroom for the refresh's own round trip — the same margin ``workerPool``'s equivalent check leaves against `processingTimeout`.
-<2> Without a keepalive nothing re-stamps the lease at all, so a handler allowed to outlive it is *guaranteed* to still be running at the reclaim.
-This is the likelier mistake of the two: the first check is vacuous when `keepalive` is null, which is exactly the case where a raised `timeout` is most tempting.
+<1> At `timeout <= tickTimeout`, the tick's own `withTimeout` would, on its own, always fire — and hand the window back — before the lease could go stale on its own.
+<2> But condition 1 alone assumes `runTick` starts running the moment the lease is taken.
+It doesn't always: `now` here is read when `runTick` actually starts, and if the handover since the lease was stamped has already eaten into ``tickGrace``'s own margin, finishing `timeout` after *that* point can still land past the reclaim threshold (`expiresAt + tickGrace`) even though `timeout` never exceeded `tickTimeout` itself.
+<3> Recomputed every cycle from the *live* remaining lease, not fixed once.
+`extendLease` resets the lease to a fresh `tickTimeout`, so after the first cycle this converges to a stable `tickTimeout * 0.65` wait — 35% of the lease left as margin before the next scheduled `extendLease` — comfortably ahead of a reclaim, which only fires once the full `tickTimeout + tickGrace` has passed since the last stamp.
 
-So the supported ways to run a tick for longer than `tickTimeout` are to pass a `keepalive` shorter than `tickTimeout`, or to raise `tickTimeout` to match the work.
-The defaults (`timeout` = `tickTimeout`, no keepalive) satisfy the second check trivially.
+There is nothing left to misconfigure: a tick can take as much `timeout` as it needs, and its lease is kept alive for exactly that long, automatically.
+See <<safeguard-keepalive>> and <<safeguard-stale-start>>.
 
 
 [[corner-missing-cursor]]
