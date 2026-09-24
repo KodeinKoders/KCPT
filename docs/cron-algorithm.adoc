@@ -514,6 +514,13 @@ Job 3 can: `LEAST(...)` returns `NULL` only when both subqueries are `NULL`, whi
 No degenerate or inverted window can be created, so — unlike the single-row design this replaced — no defensive check is needed.
 
 
+[[corner-table-names]]
+=== Table names
+
+`CronTables` validates its table names the same way `kcpt-message-queue`'s own table holder does, because both go through the identical `kcpt-core` primitive.
+See xref:message-queue-algorithm.adoc#corner-long-name[Queue and table names] for why validation rather than escaping is the only safe option here.
+
+
 [[corner-completion-order]]
 === Windows complete out of order
 

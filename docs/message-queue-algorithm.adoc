@@ -706,6 +706,7 @@ A queue name is validated to 1..32 characters at construction, matching the `VAR
 Without that check a longer name is accepted and fails only at the first `post()`, as a driver-level "value too long" that never mentions which queue.
 
 Table names are validated as optionally-qualified identifiers rather than escaped, because they are interpolated as identifiers and no escaping function makes that safe after the fact: `escapeIdentifier` would quote `public.mq_messages` into a single identifier in the current schema, breaking the qualification.
+The validation itself — `validatedTableName` — lives in `kcpt-core`, not here: it is shared verbatim with `kcpt-cron`'s own table names (see xref:cron-algorithm.adoc#corner-table-names[Table names] in the cron document).
 
 
 [[guarantees]]
