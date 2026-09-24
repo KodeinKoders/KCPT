@@ -23,10 +23,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
-import kotlinx.serialization.SerializationException
 import org.postgresql.PGConnection
 import org.postgresql.core.Utils
 import java.sql.Connection
+import kotlin.coroutines.cancellation.CancellationException
 
 
 // getNotifications blocks for up to this long, and the listening loop only notices it has been
@@ -150,7 +150,18 @@ public class PGChannel<T>(
                                     val element =
                                         try {
                                             kcptJson.decodeFromString(serializer, notification.parameter)
-                                        } catch (cause: SerializationException) {
+                                        } catch (cause: CancellationException) {
+                                            throw cause
+                                        } catch (cause: Throwable) {
+                                            // Not narrowed to SerializationException: a built-in serializer like
+                                            // Instant's can throw a bare IllegalArgumentException directly
+                                            // (Instant.parse does, on a validly-JSON-encoded but unparseable
+                                            // string) without ever wrapping it in one, and serializer is
+                                            // caller-supplied besides — this loop must survive whatever it
+                                            // throws, the same way report() already survives whatever
+                                            // onUndecodableNotification throws. CancellationException is
+                                            // re-thrown above rather than reported, since it is never a
+                                            // decoding failure.
                                             report(notification.parameter, cause)
                                             return@forEach
                                         }

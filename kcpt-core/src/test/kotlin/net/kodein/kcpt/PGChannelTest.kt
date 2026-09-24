@@ -14,8 +14,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.encoding.Decoder
 import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.Test
 import kotlin.coroutines.cancellation.CancellationException
@@ -23,8 +26,10 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 
 @Serializable
 data class Foo(val bar: String)
@@ -163,6 +168,86 @@ class PGChannelTest : AbstractPgsqlTest() {
             assertEquals(name, reportedChannel)
             assertEquals("not-json-at-all", payload)
             assertTrue(cause is SerializationException, "expected the decode failure as the cause, got $cause")
+        }
+    }
+
+    // Unlike the malformed-JSON case above, a validly-JSON-encoded string that isn't a valid instant
+    // decodes past the JSON layer and only fails inside Instant.serializer()'s own deserialize, which
+    // calls Instant.parse and throws a bare IllegalArgumentException rather than a SerializationException
+    // — kcpt-message-queue's and kcpt-cron's own notification channels both use Instant.serializer(),
+    // so this is the shape of payload they would actually receive from a misbehaving or hostile NOTIFY.
+    @Test
+    fun aValidJsonStringThatIsNotAValidInstantIsDroppedAndReported() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val reports = CopyOnWriteArrayList<Triple<String, String, Throwable>>()
+            val name = "badinstant_${uniqueQueueName()}"
+            val channel = PGChannel(name, Instant.serializer()) { reportedChannel, payload, cause ->
+                reports += Triple(reportedChannel, payload, cause)
+            }
+
+            launch {
+                val flow = dataSource.asSource().openListenConnection(this, channel)
+                val received = kotlinx.coroutines.CompletableDeferred<Instant>()
+                val collector = launch { received.complete(flow.first()) }
+                delay(300.milliseconds) // let the collector subscribe before anything is sent
+
+                dataSource.rawNotify(name, "\"garbage\"") // valid JSON string, not a valid Instant
+                val good = Clock.System.now()
+                dataSource.connection.use { connection -> connection.notify(channel, good) }
+
+                assertEquals(
+                    good,
+                    withTimeoutOrNull(5.seconds) { received.await() },
+                    "the flow must survive the unparseable instant and deliver the next notification",
+                )
+                collector.cancel()
+                cancel()
+            }.join()
+
+            assertEquals(1, reports.size, "the unparseable instant must be reported, not silently dropped")
+            val (reportedChannel, payload, cause) = reports.single()
+            assertEquals(name, reportedChannel)
+            assertEquals("\"garbage\"", payload)
+            assertTrue(cause is IllegalArgumentException, "expected Instant.parse's failure as the cause, got $cause")
+        }
+    }
+
+    // A genuine CancellationException surfacing from decoding must never be treated like an ordinary
+    // decode failure: reporting it through onUndecodableNotification and continuing would silently
+    // swallow the cancellation, the exact class of bug the CancellationException/Throwable split
+    // exists to avoid. It must tear the listening loop down instead of delivering anything further.
+    @Test
+    fun aCancellationDuringDecodeIsNeverReportedAsUndecodable() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val reports = CopyOnWriteArrayList<Triple<String, String, Throwable>>()
+            val name = "cancelduringdecode_${uniqueQueueName()}"
+            val serializer = object : KSerializer<Foo> by Foo.serializer() {
+                override fun deserialize(decoder: Decoder): Foo {
+                    val value = Foo.serializer().deserialize(decoder)
+                    if (value.bar == "cancel-me") throw CancellationException("synthetic cancellation")
+                    return value
+                }
+            }
+            val channel = PGChannel(name, serializer) { reportedChannel, payload, cause ->
+                reports += Triple(reportedChannel, payload, cause)
+            }
+
+            launch {
+                val flow = dataSource.asSource().openListenConnection(this, channel)
+                val collector = launch {
+                    assertNull(
+                        withTimeoutOrNull(3.seconds) { flow.first() },
+                        "a genuine CancellationException from decoding must tear the listening loop down, " +
+                            "not deliver anything further",
+                    )
+                }
+                delay(300.milliseconds)
+                dataSource.connection.use { connection -> connection.notify(channel, Foo("cancel-me")) }
+                collector.join()
+                cancel()
+            }.join()
+
+            assertEquals(0, reports.size, "a CancellationException must never be reported via onUndecodableNotification")
         }
     }
 
