@@ -229,9 +229,8 @@ public suspend fun <T> Message<T>.process(
     // A handler must never be attempted once its lease has already nominally expired: by that
     // point the row may already be visible to another consumer's reclaim query, and running the
     // handler here would be racing that consumer rather than genuinely holding the message. This
-    // is a sign of a delay far larger than processingGrace was ever sized to absorb — a saturated
-    // dispatcher, a paused process — not something to quietly proceed through and hope for the
-    // best.
+    // is a sign of a handover delay at least as large as the lease itself — a saturated dispatcher,
+    // a paused process — not something to quietly proceed through and hope for the best.
     check(expiresAt - now > Duration.ZERO) {
         "This message's lease already expired before processing could start " +
             "(expiresAt=$expiresAt, now=$now) — it may already be held by another consumer."

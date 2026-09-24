@@ -492,10 +492,10 @@ internal class CronImpl(
         // A tick must never be attempted once its lease has already nominally expired: by that
         // point the row may already be visible to another server's reclaim query, and running the
         // handler here would be racing that server rather than genuinely holding the window. This
-        // is a sign of a delay far larger than tickGrace was ever sized to absorb, not something
-        // to quietly proceed through. Thrown here rather than swallowed: run()'s own outer catch
-        // still contains it — reported through onError, the loop backs off by tickGrace and
-        // continues — exactly as any other infrastructure surprise in this file already is.
+        // is a sign of a handover delay at least as large as the lease itself, not something to
+        // quietly proceed through. Thrown here rather than swallowed: run()'s own outer catch still
+        // contains it — reported through onError, the loop backs off by tickGrace and continues —
+        // exactly as any other infrastructure surprise in this file already is.
         check(expiresAt - now > Duration.ZERO) {
             "This tick's lease already expired before processing could start " +
                 "(expiresAt=$expiresAt, now=$now) — it may already be held by another server."
