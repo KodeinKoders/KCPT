@@ -389,6 +389,8 @@ newFixedThreadPoolContext(numberOfThreads, "KCPT-WorkerPool").use { dispatcher -
                               catch (e: Throwable) { semaphore.release(); throw e }
                 launch(dispatcher) {                                 // <2>
                     try { message.process(timeout, ...) }
+                    catch (e: CancellationException) { throw e }
+                    catch (e: Throwable) { onUnhandledFailure(message, e) }   // <3>
                     finally { semaphore.release() }
                 }
             }
@@ -398,6 +400,7 @@ newFixedThreadPoolContext(numberOfThreads, "KCPT-WorkerPool").use { dispatcher -
 ----
 <1> The permit is taken **before** the message.
 <2> Processing is dispatched to the pool's own threads; the loop returns to <1> immediately.
+<3> Anything `process()` throws before its own guard even begins — see <<safeguard-contained-unhandled-failure>>.
 
 The acquire-then-receive order is the back-pressure, and it is deliberate:
 
@@ -507,6 +510,7 @@ check(expiresAt - now > Duration.ZERO) { "..." }
 
 This runs once, before anything else, using the same `now()` the keepalive decision below reasons from.
 It throws `IllegalStateException` — this is a state the message was found in, not an argument the caller passed — and nothing catches it inside `process()`, so it propagates straight out.
+See <<safeguard-contained-unhandled-failure>> for what happens to it from there.
 
 
 [[safeguard-keepalive]]
@@ -601,6 +605,16 @@ One message's transient blip would abort every other message in flight.
 It is contained instead, and reported through `onRequeueFailure`.
 Nothing is lost by containing it: the `UPDATE` that would have cleared `started_at` is the one that failed, so the lease stands and the row stays invisible until it expires, at which point the reclaim path counts the try exactly as this requeue would have.
 The only cost is that redelivery waits for `processingTimeout + processingGrace` instead of happening now.
+
+
+[[safeguard-contained-unhandled-failure]]
+=== A failure before `process()` begins cannot kill the pool
+
+<<safeguard-stale-start>>'s already-expired-lease `check()` throws before ``process()``'s own internal `try` even starts, so nothing inside `process()` ever sees it — it propagates straight out, from inside ``workerPool``'s `launch`, cancelling the pool's whole scope exactly like an unguarded requeue failure above.
+One message found in a bad state would abort every other message in flight.
+
+It is contained the same way: ``workerPool``'s worker `launch` catches it — `CancellationException` re-thrown first, so the pool's own shutdown is never mistaken for this — and reports it through `onUnhandledFailure`.
+Nothing is lost by containing it: the message was never touched, so its lease stands exactly as <<safeguard-stale-start>> already left it, and the row is reclaimed on the same schedule it would have been anyway.
 
 
 [[safeguard-observers]]

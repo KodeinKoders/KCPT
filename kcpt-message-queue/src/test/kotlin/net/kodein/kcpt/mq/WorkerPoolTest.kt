@@ -21,6 +21,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 class WorkerPoolTest : AbstractPgsqlTest() {
@@ -205,6 +206,50 @@ class WorkerPoolTest : AbstractPgsqlTest() {
             withTimeoutOrNullAssert(8.seconds, "the message must eventually be redelivered once its lease expires") {
                 awaitUntil { attempts.get() >= 2 }
             }
+            poolJob.cancelAndJoin()
+        }
+    }
+
+    // The blast radius of a failure that escapes process() before its own guard even begins: the
+    // already-expired-lease check() in Message.kt throws before process()'s internal try starts, so
+    // nothing inside process() ever sees it. Unguarded here too, it would cancel the pool's scope and
+    // take every other in-flight message down with it, the same way an unguarded requeue failure
+    // would above.
+    @Test
+    fun workerPoolSurvivesAFailureBeforeProcessBegins() = runTest(timeout = 10.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val queue = uniqueQueueName()
+            // A processingTimeout this small means ordinary dispatch overhead alone — the message
+            // travelling back out of receiveNext(), the worker being scheduled onto the pool's own
+            // dispatcher — reliably exceeds it, so the lease reads as already expired the moment
+            // process() gets a chance to check it, with no need to touch the database directly.
+            val q = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix)
+                .messageQueue(queue, User.serializer(), MessageQueue.Config(processingTimeout = 1.nanoseconds))
+            q.post(User(1, "A"))
+
+            val processed = ConcurrentLinkedQueue<Int>()
+            val reported = ConcurrentLinkedQueue<Throwable>()
+            val poolJob = launch {
+                q.workerPool(
+                    numberOfWorkers = 1,
+                    onUnhandledFailure = { _, cause -> reported += cause },
+                ) { message ->
+                    processed += message.payload.id
+                    null
+                }
+            }
+
+            withTimeoutOrNullAssert(5.seconds, "the failure must be reported through onUnhandledFailure") {
+                awaitUntil { reported.isNotEmpty() }
+            }
+            assertTrue(poolJob.isActive, "the pool must survive a failure thrown before process() begins")
+            assertTrue(
+                reported.first() is IllegalStateException,
+                "expected the already-expired-lease check()'s own failure, got ${reported.first()}",
+            )
+            assertTrue(processed.isEmpty(), "process() itself must never have been reached")
+
             poolJob.cancelAndJoin()
         }
     }

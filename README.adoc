@@ -239,6 +239,8 @@ queue.workerPool(
 `workerPool` never returns — cancel its coroutine to shut it down.
 See xref:docs/message-queue-algorithm.adoc#the-worker-pool[The worker pool] for why the receive-then-dispatch ordering is deliberate, not incidental.
 
+A failure `process()` itself never got the chance to handle — the already-expired-lease `IllegalStateException` `process()` can throw before its own guarded region even begins, most concretely — is caught and reported through `onUnhandledFailure(message, cause)` rather than being left to cancel the whole pool; see xref:docs/message-queue-algorithm.adoc#safeguard-contained-unhandled-failure[the algorithm doc] for the full mechanism.
+
 
 === `Message<T>`
 
