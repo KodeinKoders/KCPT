@@ -96,4 +96,45 @@ class CronCadenceTest : AbstractPgsqlTest() {
             }
         }
     }
+
+    // Unlike windowEnd, this is a real, measurable difference — not a single-instant boundary a
+    // wall-clock integration test could never pin down — so a genuine assertion on the observed
+    // windows is meaningful here.
+    @Test
+    fun aShortenWindowHookProducesShorterOnGridWindows() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val name = uniqueQueueName()
+            val interval = 2.seconds
+            val config = Cron.Config(interval = interval)
+
+            val sink = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
+            val cron = sink.cron(name, config)
+            val windows = CopyOnWriteArrayList<Pair<Instant, Instant>>()
+
+            val runner = launch {
+                cron.run(shortenWindow = { from, _ -> from + interval / 2 }) { from, to ->
+                    windows += from to to
+                    null
+                }
+            }
+
+            awaitUntil(timeout = 10.seconds) { windows.size >= 3 }
+            runner.cancelAndJoin()
+
+            val first = windows[0].first
+            for ((index, window) in windows.withIndex()) {
+                val expectedFrom = first + (interval / 2) * index
+                val expectedTo = expectedFrom + interval / 2
+                assertTrue(
+                    (window.first - expectedFrom).let { it.inWholeMilliseconds in -50..50 },
+                    "window $index's from should be at $expectedFrom, was ${window.first}",
+                )
+                assertTrue(
+                    (window.second - expectedTo).let { it.inWholeMilliseconds in -50..50 },
+                    "window $index's to should be shortened to $expectedTo, was ${window.second}",
+                )
+            }
+        }
+    }
 }

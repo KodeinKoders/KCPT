@@ -193,14 +193,24 @@ It doesn't change ``to``'s own computed value either way: `Instant` is a continu
 [source,kotlin]
 ----
 val behindBy = now - nextSlotAt
-val to = if (behindBy < interval * 2) nextGridBoundary                    // steady state
+val to = if (behindBy < interval * 2) steadyStateWindowTo(nextSlotAt, nextGridBoundary, shortenWindow)
          else minOf(nextSlotAt + maxInterval, now)                        // catch-up
+
+suspend fun steadyStateWindowTo(from: Instant, defaultTo: Instant, shortenWindow: ...): Instant {
+    val proposed = shortenWindow(from, defaultTo)
+    require(proposed > from) { "..." }
+    return minOf(proposed, defaultTo)                                    // never later than defaultTo
+}
 ----
 
 The steady-state branch is the one that keeps ticks on the clock.
-Note what it does *not* do: it never looks at `now` when computing `to`.
-The window ends at the exact grid boundary whether this materialization happened right on time or 30 seconds late, so lateness never accumulates into the schedule.
+Note what it does *not* do: it never looks at `now` when computing the *nominal* boundary (`nextGridBoundary`).
+The window ends there, or earlier, whether this materialization happened right on time or 30 seconds late, so lateness never accumulates into the schedule.
 The catch-up threshold (`behindBy < interval * 2`) is unaffected by `windowEnd` too — it's a separate "how far past elapsed are we" policy, not a question of which side owns the boundary.
+
+`shortenWindow` is ``Cron.run()``'s own parameter, given to whichever server actually wins the materialize race, and it can only ever make the window *smaller*: a proposal past `nextGridBoundary` is silently clamped back down to it, and a proposal that isn't after `from` — a zero- or negative-length window — is rejected outright, surfacing through ``run()``'s own `onError` the same way any other materialize-time failure already does.
+It is deliberately **not consulted for a catch-up chunk**: that branch is answering a different question — how much backlog to absorb in one go, capped at `maxInterval` and clamped to `now` — not "how much to trim off the front of an on-time window", so it keeps its own unmodified formula.
+A shortened window still chains correctly into the next one, exactly like a catch-up chunk does: the cursor advances to whatever `to` actually was, so the next window's `from` picks up right there, and the grid simply continues from that point rather than snapping back to some earlier, now-abandoned alignment — the same "no stable grid across outages" non-guarantee (<<catch-up>>) already covers this.
 
 The transaction then inserts the row, advances the cursor past it, and notifies:
 

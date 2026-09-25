@@ -429,6 +429,7 @@ One call per server — every server calling `run()` runs the identical loop, an
 ----
 public suspend fun run(
     timeout: Duration = config.tickTimeout,
+    shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant = { _, defaultTo -> defaultTo },
     onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
     onFailure: (failure: CronTickFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
     onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
@@ -438,6 +439,7 @@ public suspend fun run(
 ----
 
 `timeout` bounds the tick — freely longer than `tickTimeout`, since a tick's lease is kept alive automatically whenever it genuinely needs one, exactly like ``Message<T>.process()``'s own automatic keepalive: no parameter to configure, and nothing to misconfigure (see xref:docs/cron-algorithm.adoc#corner-timeout-above-lease[Running a handler for longer than its lease]).
+`shortenWindow` lets whichever server wins the materialize race end a steady-state window earlier than its nominal boundary — the window can only ever come out smaller than expected, never larger, and it is never consulted for a catch-up chunk (see xref:docs/cron-algorithm.adoc#job-1-materialize[Job 1 — materialize] for the full contract).
 `onError` reports an infrastructure failure — a dropped connection, an exhausted pool, a tick whose lease had already expired before it could even start — in the materialize/lease/write-back queries themselves, distinct from `onFailure`, which reports the handler's own failures.
 
 `run()` never returns — cancel its coroutine to shut a server down.

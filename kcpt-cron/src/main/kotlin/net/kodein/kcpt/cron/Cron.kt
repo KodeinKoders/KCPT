@@ -105,6 +105,18 @@ public interface Cron {
         // long as it runs — exactly like Message<T>.process()'s own automatic keepalive; there is
         // no parameter here to configure or misconfigure.
         timeout: Duration = config.tickTimeout,
+        // Lets the server that wins the materialize race for a steady-state window end it earlier
+        // than nextSlotAt + interval — the window is always the size it would have been, or
+        // smaller, never larger (a result later than that is silently clamped). Suspend, unlike
+        // onSuccess/onFailure/onDeadLetter/onError: deciding how much to shorten by may itself need
+        // to check external state (a queue depth, another table), unlike those, which only ever
+        // report an outcome that already happened. Runs inside attemptMaterialize()'s own
+        // transaction, holding the cursor row's lock for as long as it takes — SKIP LOCKED means
+        // this never blocks another server, only prolongs this one's own commit. Not consulted for
+        // a catch-up chunk: that shape answers a different question ("how much backlog to absorb in
+        // one go"), not "how much to trim off the front of an on-time window", and keeps its own
+        // unmodified formula.
+        shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant = { _, defaultTo -> defaultTo },
         onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
         onFailure: (failure: CronTickFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
         onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
@@ -156,6 +168,23 @@ internal fun windowHasElapsed(now: Instant, to: Instant, windowEnd: Cron.WindowE
         Cron.WindowEnd.INCLUSIVE -> now > to
     }
 
+// Top-level and extracted for the same reason as windowHasElapsed: directly unit-testable without a
+// database. "Never longer" is enforced here, not trusted from the caller — a proposal past defaultTo
+// is silently clamped down to it. A non-positive-length proposal is a caller bug, not something to
+// paper over, so it throws instead: it will surface through run()'s onError, the same path any other
+// materialize-time failure already takes.
+internal suspend fun steadyStateWindowTo(
+    from: Instant,
+    defaultTo: Instant,
+    shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant,
+): Instant {
+    val proposed = shortenWindow(from, defaultTo)
+    require(proposed > from) {
+        "shortenWindow returned $proposed, which is not after from ($from)"
+    }
+    return minOf(proposed, defaultTo)
+}
+
 internal class CronImpl(
     override val name: String,
     override val config: Cron.Config,
@@ -202,11 +231,15 @@ internal class CronImpl(
     // further before ever attempting to lease anything — that's what lets several servers work
     // different catch-up chunks at once: each chunk commits (and notifies) independently, so an
     // idle server can start on chunk 1 the instant it lands, while this one moves on to chunk 2.
-    private suspend fun tryMaterialize(): Boolean = withContext(Dispatchers.IO) {
-        source().use { connection -> connection.attemptMaterialize() }
+    private suspend fun tryMaterialize(
+        shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant,
+    ): Boolean = withContext(Dispatchers.IO) {
+        source().use { connection -> connection.attemptMaterialize(shortenWindow) }
     }
 
-    private suspend fun Connection.attemptMaterialize(): Boolean = transaction {
+    private suspend fun Connection.attemptMaterialize(
+        shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant,
+    ): Boolean = transaction {
         val now = Clock.System.now()
         val nextSlotAt = prepareStatement(
             "SELECT next_slot_at FROM ${tables.crons} WHERE name = ? FOR UPDATE SKIP LOCKED"
@@ -228,8 +261,10 @@ internal class CronImpl(
         // drifting by however long materialization happened to take. Only once genuinely behind
         // by more than one whole extra interval does this fall back to a maxInterval-capped,
         // now-clamped catch-up chunk. Unaffected by windowEnd: this is a separate "how far past
-        // elapsed are we" policy, not a question of which side owns the boundary.
-        val to = if (behindBy < config.interval * 2) nextGridBoundary
+        // elapsed are we" policy, not a question of which side owns the boundary. shortenWindow is
+        // consulted here and only here — a catch-up chunk answers "how much backlog to absorb", not
+        // "how much to trim off an on-time window", so it keeps its own unmodified formula below.
+        val to = if (behindBy < config.interval * 2) steadyStateWindowTo(nextSlotAt, nextGridBoundary, shortenWindow)
         else minOf(nextSlotAt + config.maxInterval, now)
 
         prepareStatement(
@@ -431,6 +466,7 @@ internal class CronImpl(
 
     override suspend fun run(
         timeout: Duration,
+        shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant,
         onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit,
         onFailure: (failure: CronTickFailure) -> JsonElement,
         onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit,
@@ -466,7 +502,7 @@ internal class CronImpl(
             try {
                 while (true) {
                     try {
-                        if (tryMaterialize()) continue
+                        if (tryMaterialize(shortenWindow)) continue
 
                         when (val outcome = tryLease()) {
                             is LeaseOutcome.DeadLettered ->

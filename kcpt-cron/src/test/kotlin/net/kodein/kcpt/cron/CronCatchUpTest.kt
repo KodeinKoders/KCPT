@@ -124,6 +124,47 @@ class CronCatchUpTest : AbstractPgsqlTest() {
         }
     }
 
+    // shortenWindow answers "how much to trim off an on-time window" — a catch-up chunk is a
+    // different question ("how much backlog to absorb in one go") and must ignore it entirely, even
+    // when supplied a hook that would otherwise shrink every window down to almost nothing.
+    @Test
+    fun shortenWindowIsNotConsultedForACatchUpChunk() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val prefix = uniquePrefix()
+            val name = uniqueQueueName()
+            val config = Cron.Config(interval = 10.minutes, maxInterval = 1.days, retries = 3)
+
+            val sink = CronSink(source = dataSource.asSource(), tablesPrefix = prefix)
+            sink.initialize()
+
+            val now = Clock.System.now()
+            val nextSlotAt = now - 70.hours
+            dataSource.rawInsertCronCursor(prefix, name, nextSlotAt)
+
+            val cron = sink.cron(name, config, startAt = nextSlotAt)
+
+            val windows = CopyOnWriteArrayList<Pair<Instant, Instant>>()
+            val runner = launch {
+                cron.run(shortenWindow = { from, _ -> from + 1.seconds }) { from, to ->
+                    windows += from to to
+                    null
+                }
+            }
+
+            withTimeoutOrNull(10.seconds) { awaitUntil { windows.size >= 3 } }
+                ?: throw AssertionError("expected 3 catch-up ticks, only saw ${windows.size}: $windows")
+            runner.cancelAndJoin()
+
+            val (first, second, third) = windows
+            approxEquals(nextSlotAt, first.first, "first window's from")
+            approxEquals(first.first + 1.days, first.second, "first window's to (capped at maxInterval, not shortened)")
+            approxEquals(first.second, second.first, "second window chains onto the first")
+            approxEquals(second.first + 1.days, second.second, "second window's to (capped at maxInterval, not shortened)")
+            approxEquals(second.second, third.first, "third window chains onto the second")
+            approxEquals(now, third.second, "the last catch-up window should still end at ~now, not from + 1s")
+        }
+    }
+
     // A DB round trip can lose sub-second precision, so exact Instant equality is too strict here.
     private fun approxEquals(expected: Instant, actual: Instant, message: String) {
         assertTrue(
