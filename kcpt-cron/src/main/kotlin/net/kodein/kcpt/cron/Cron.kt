@@ -45,12 +45,24 @@ public interface Cron {
     public val name: String
     public val config: Config
 
+    // Only one instant is ever in question: the boundary `to` shares with the next window's `from`.
+    // `from` is always inclusive on both sides. Since Instant is a continuum with no "instant just
+    // before to", this changes nothing about to's own computed value (Config.windowEnd's own comment
+    // has the full reasoning) — only whether reaching it exactly counts as this window being done.
+    public enum class WindowEnd { EXCLUSIVE, INCLUSIVE }
+
     public data class Config(
         val interval: Duration,
         val maxInterval: Duration = interval * 50,
         val retries: Int = 5,
         val tickTimeout: Duration = interval,
         val tickGrace: Duration = maxOf(tickTimeout * .2, MIN_TICK_GRACE),
+        // EXCLUSIVE ([from, to)) is the more common convention for a contiguous range — length is
+        // just to - from, no off-by-one — and is the default. INCLUSIVE ((from, to]) is offered for
+        // callers whose own downstream data treats the boundary instant as belonging to this window
+        // rather than the next one. Either way to's own value is unaffected: see WindowEnd's own
+        // comment for why.
+        val windowEnd: WindowEnd = WindowEnd.EXCLUSIVE,
     ) {
         init {
             // A tick is only ever materialized once its own window has fully elapsed, so at zero
@@ -135,6 +147,15 @@ public sealed class CronTickFailure {
 
 private val leaseExpiredNote: JsonElement = JsonObject(mapOf("cause" to JsonPrimitive("leaseExpired")))
 
+// Top-level rather than a CronImpl member, and extracted at all, so it's directly unit-testable at
+// the exact boundary instant without constructing a CronImpl — a single-instant difference between
+// the two conventions isn't something a real wall-clock integration test could ever pin down.
+internal fun windowHasElapsed(now: Instant, to: Instant, windowEnd: Cron.WindowEnd): Boolean =
+    when (windowEnd) {
+        Cron.WindowEnd.EXCLUSIVE -> now >= to
+        Cron.WindowEnd.INCLUSIVE -> now > to
+    }
+
 internal class CronImpl(
     override val name: String,
     override val config: Cron.Config,
@@ -198,15 +219,17 @@ internal class CronImpl(
 
         // The cursor's own row is missing (dropped by hand) is handled by wakeUpAt() returning
         // null, not here — SKIP LOCKED cannot tell "no row" apart from "someone else has it".
-        if (now < nextSlotAt + config.interval) return@transaction false
+        val nextGridBoundary = nextSlotAt + config.interval
+        if (!windowHasElapsed(now, nextGridBoundary, config.windowEnd)) return@transaction false
 
         val behindBy = now - nextSlotAt
         // Steady state: exactly one grid slot, its end never looked at relative to "now" beyond
         // the threshold check above — this is what keeps ticks landing on the clock rather than
         // drifting by however long materialization happened to take. Only once genuinely behind
         // by more than one whole extra interval does this fall back to a maxInterval-capped,
-        // now-clamped catch-up chunk.
-        val to = if (behindBy < config.interval * 2) nextSlotAt + config.interval
+        // now-clamped catch-up chunk. Unaffected by windowEnd: this is a separate "how far past
+        // elapsed are we" policy, not a question of which side owns the boundary.
+        val to = if (behindBy < config.interval * 2) nextGridBoundary
         else minOf(nextSlotAt + config.maxInterval, now)
 
         prepareStatement(
@@ -377,6 +400,13 @@ internal class CronImpl(
     // PostgreSQL, so the whole expression is null only if *both* subqueries are: no cursor row,
     // and no currently-leased tick for this name — the latter can't happen without the former,
     // since only materialization, which requires the cursor, ever creates a tick row).
+    //
+    // Unaware of windowEnd, deliberately: this is a sleep-until hint, not the gate itself (that's
+    // windowHasElapsed, in attemptMaterialize). Under INCLUSIVE, waking exactly at this instant
+    // just means attemptMaterialize finds the window not yet elapsed and this loops back through
+    // here once more — a fraction of a millisecond later, once real time has moved past it, the
+    // very next attempt succeeds. Not worth the complexity of computing a separate, windowEnd-aware
+    // wake instant for that.
     private suspend fun wakeUpAt(): Instant? = withContext(Dispatchers.IO) {
         source().use { connection ->
             connection.prepareStatement(

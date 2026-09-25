@@ -364,7 +364,7 @@ Getting this wrong — never calling any of the three, or calling one on a lease
 
 == Core concepts — Cron
 
-A cron fires a *tick* — one call to the handler — for a *window*, a half-open time range `[from, to)` the size of `interval`.
+A cron fires a *tick* — one call to the handler — for a *window*, a time range the size of `interval`: `[from, to)` by default (`to` excluded), or `(from, to]` (`to` included) with `Cron.Config.windowEnd` set to `WindowEnd.INCLUSIVE`.
 A window is *materialized* — turned from pure arithmetic on a schedule into an actual claimable row — once it has fully elapsed, then leased and run exactly like a message.
 
 
@@ -413,6 +413,11 @@ val cleanup = cronSink.cron(
 | `tickGrace`
 | `max(tickTimeout * .2, 200ms)`
 | Extra margin before a reclaim, so a handler's own timeout always fires first.
+
+| `windowEnd`
+| `WindowEnd.EXCLUSIVE`
+| Which side of a window owns the boundary it shares with the next one: `EXCLUSIVE` for `[from, to)`, `INCLUSIVE` for `(from, to]`.
+See xref:docs/cron-algorithm.adoc#job-1-materialize[the algorithm doc] — it changes less than it sounds like.
 |===
 
 

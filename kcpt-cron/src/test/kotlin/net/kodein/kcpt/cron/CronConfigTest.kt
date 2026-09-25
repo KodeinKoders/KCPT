@@ -40,6 +40,11 @@ class CronConfigTest {
     }
 
     @Test
+    fun theDefaultWindowEndIsExclusive() {
+        assertEquals(Cron.WindowEnd.EXCLUSIVE, Cron.Config(interval = 1.minutes).windowEnd)
+    }
+
+    @Test
     fun negativeRetriesIsRejected() {
         assertFailsWith<IllegalArgumentException> { Cron.Config(interval = 1.minutes, retries = -1) }
         Cron.Config(interval = 1.minutes, retries = 0) // dead-letter on first failure is meaningful

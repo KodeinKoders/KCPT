@@ -28,7 +28,8 @@ These terms are used precisely throughout this document and in the code.
 | One execution of the user's handler for one time window.
 
 | *Window*
-| A half-open time range `[from, to)` that a tick is responsible for.
+| A time range `[from, to)` that a tick is responsible for — half-open, `to` excluded, by default.
+`Cron.Config.windowEnd` can flip that to `(from, to]`, `to` included instead; see <<job-1-materialize>> for what that actually changes (less than it sounds like).
 Windows never overlap, and each one is handled exactly once (barring the at-least-once caveat in <<guarantees>>).
 
 | *Grid*
@@ -171,20 +172,35 @@ SELECT next_slot_at FROM <prefix>crons WHERE name = ? FOR UPDATE SKIP LOCKED
 `FOR UPDATE` locks the cursor row for the rest of the transaction, so only one server anywhere can be creating a window for this cron at any instant.
 `SKIP LOCKED` means a server that loses that race gets zero rows back immediately instead of blocking, and simply moves on to job 2.
 
-If the row comes back, the window's end is decided:
+If the row comes back, whether the window has elapsed yet is decided first:
 
 [source,kotlin]
 ----
-if (now < nextSlotAt + interval) return false   // the window has not finished elapsing yet
+val nextGridBoundary = nextSlotAt + interval
+if (!windowHasElapsed(now, nextGridBoundary, windowEnd)) return false
 
+fun windowHasElapsed(now: Instant, to: Instant, windowEnd: WindowEnd): Boolean = when (windowEnd) {
+    WindowEnd.EXCLUSIVE -> now >= to    // the default: elapsed the instant now reaches to
+    WindowEnd.INCLUSIVE -> now > to     // elapsed only once now is strictly past to
+}
+----
+
+`windowEnd` is `Cron.Config.windowEnd`, and this is the *only* place it matters — nowhere else compares against a sub-window instant.
+It doesn't change ``to``'s own computed value either way: `Instant` is a continuum with no "instant just before `to`" to substitute, so both conventions describe the exact same boundary point, differing only in whether reaching it exactly already counts as this window being done.
+
+`to` itself is then decided:
+
+[source,kotlin]
+----
 val behindBy = now - nextSlotAt
-val to = if (behindBy < interval * 2) nextSlotAt + interval               // steady state
+val to = if (behindBy < interval * 2) nextGridBoundary                    // steady state
          else minOf(nextSlotAt + maxInterval, now)                        // catch-up
 ----
 
 The steady-state branch is the one that keeps ticks on the clock.
 Note what it does *not* do: it never looks at `now` when computing `to`.
 The window ends at the exact grid boundary whether this materialization happened right on time or 30 seconds late, so lateness never accumulates into the schedule.
+The catch-up threshold (`behindBy < interval * 2`) is unaffected by `windowEnd` too — it's a separate "how far past elapsed are we" policy, not a question of which side owns the boundary.
 
 The transaction then inserts the row, advances the cursor past it, and notifies:
 
