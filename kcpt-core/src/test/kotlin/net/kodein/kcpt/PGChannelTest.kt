@@ -1,9 +1,11 @@
 package net.kodein.kcpt
 
 import com.zaxxer.hikari.HikariDataSource
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -19,8 +21,10 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.encoding.Decoder
+import java.sql.Connection
 import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.Test
+import org.postgresql.PGConnection
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -248,6 +252,52 @@ class PGChannelTest : AbstractPgsqlTest() {
             }.join()
 
             assertEquals(0, reports.size, "a CancellationException must never be reported via onUndecodableNotification")
+        }
+    }
+
+    // A dropped listening connection is a driver-level failure with no decoding involved at all —
+    // <<A1>>'s guard around decodeFromString cannot help here. This is the reason connectionJob is a
+    // SupervisorJob rather than a plain Job: one connection breaking this way must not cancel the
+    // caller's own scope, matching the real usage this mimics (WorkerPool's or Cron.run()'s own
+    // scope, which must survive one bad listening connection).
+    //
+    // A CoroutineExceptionHandler is installed on the caller's own scope, rather than leaving the
+    // failure to the platform default: without one, runTest's own global exception collector
+    // (installed specifically to catch exactly this class of "silent background failure" bug) would
+    // intercept it first and fail this test regardless of whether outerJob itself was ever touched —
+    // that collector runs on the whole JVM process for the duration of any active runTest, completely
+    // outside this coroutine's own Job hierarchy. Installing a handler here means the failure is
+    // resolved through this scope's own ambient context instead, exactly the way it would be resolved
+    // in a real, non-test caller with no coroutines-test collector in play.
+    @Test
+    fun aBrokenListeningConnectionDoesNotCancelTheCallersScope() = runTest(timeout = 15.seconds) {
+        withContext(Dispatchers.Default) {
+            val channel = PGChannel("broken_${uniqueQueueName()}", Foo.serializer())
+            val rawConnection = dataSource.connection
+            val source: Source = { rawConnection }
+
+            val caughtExceptions = CopyOnWriteArrayList<Throwable>()
+            val exceptionHandler = CoroutineExceptionHandler { _, throwable -> caughtExceptions += throwable }
+            val outerJob = Job(coroutineContext[Job])
+            val outerScope = CoroutineScope(coroutineContext + outerJob + exceptionHandler)
+
+            // Mirrors MessageQueue's ReceiverImpl and Cron.run(), both of which call
+            // openListenConnection this same way: scope.async { source.openListenConnection(scope, channel) }.
+            outerScope.async { source.openListenConnection(outerScope, channel) }.await()
+
+            delay(300.milliseconds) // let the eagerly-shared polling loop actually start running
+
+            // A genuine driver-level failure: close the real, unwrapped connection out from under the
+            // listener directly, bypassing PGChannel's own teardown entirely.
+            (rawConnection.unwrap(PGConnection::class.java) as Connection).close()
+
+            awaitUntil(
+                timeout = 5.seconds,
+                message = "the broken connection's failure was never reported anywhere",
+            ) { caughtExceptions.isNotEmpty() }
+
+            assertTrue(outerJob.isActive, "a broken listening connection must not cancel the caller's own scope")
+            outerJob.cancel()
         }
     }
 

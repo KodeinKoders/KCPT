@@ -8,6 +8,7 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
@@ -109,7 +110,12 @@ public class PGChannel<T>(
             throw cause
         }
 
-        val connectionJob = Job(scope.coroutineContext[Job])
+        // A SupervisorJob, not a plain Job: a driver-level failure surfacing from the polling loop
+        // below (a dropped connection, for instance — nothing decodeFromString's own guard is
+        // involved in) must stay contained to this listening connection. A plain Job would propagate
+        // that failure upward and cancel the caller's entire scope — every other message or tick
+        // it's holding, not just this one connection — over one connection going bad.
+        val connectionJob = SupervisorJob(scope.coroutineContext[Job])
         val connectionScope = CoroutineScope(scope.coroutineContext + connectionJob)
 
         val connectionMutex = Mutex()
