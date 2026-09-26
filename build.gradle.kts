@@ -10,7 +10,7 @@ plugins {
 
 allprojects {
     group = "net.kodein.kcpt"
-    version = "1.0-SNAPSHOT"
+    version = "0.1.0"
 }
 
 // Every module needs the same toolchain, the same strict explicit-API mode, and the same set of
