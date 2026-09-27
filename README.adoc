@@ -78,10 +78,10 @@ KCPT ships three artifacts:
 Pulled in transitively by the other two — rarely a direct dependency.
 
 | `net.kodein.kcpt:kcpt-message-queue`
-| `MessageQueueSink`, `MessageQueue<T>`, `Message<T>`, `workerPool`.
+| `MessageQueueSink`, `MessageQueueSchema`, `MessageQueue<T>`, `Message<T>`, `workerPool`.
 
 | `net.kodein.kcpt:kcpt-cron`
-| `CronSink`, `Cron`.
+| `CronSink`, `CronSchema`, `Cron`.
 |===
 
 NOTE: KCPT has not been published yet.
@@ -153,6 +153,41 @@ Any reasonably current PostgreSQL server works — the test suite runs against P
 They create their own tables independently (see <<project-layout>>) but share one `properties` table between them, tracking their own migration version in it separately.
 
 
+[#managing-the-schema-yourself]
+==== Managing the schema yourself
+
+An application that manages its DDL some other way — Flyway, Liquibase, a DBA-reviewed script — can pass `manageSchema = false` to either sink.
+`initialize()` then does nothing: KCPT never creates, migrates or checks a table, and never touches the `properties` table.
+
+The exact statements the sinks would otherwise run are public, rendered for a given prefix:
+
+[source,kotlin]
+----
+val migrations: List<SchemaMigration> = MessageQueueSchema.migrations(tablesPrefix = "public.kcpt_") // <1>
+migrations.drop(appliedVersion).forEach { migration ->
+    println("-- to version ${migration.toVersion}")
+    println(migration.script) // <2>
+}
+
+val sink = MessageQueueSink(
+    source = dataSource.asSource(),
+    tablesPrefix = "public.kcpt_",
+    manageSchema = false,
+)
+----
+<1> `CronSchema.migrations(tablesPrefix)` is the cron counterpart; `MessageQueueSchema.version` and `CronSchema.version` give the version this release expects.
+<2> `statements` holds the same DDL as one statement per entry.
+
+These scripts are pure DDL: they carry none of KCPT's own version bookkeeping, since that bookkeeping only exists for the sinks' automatic migration.
+
+[IMPORTANT]
+====
+Switching a schema managed this way back to `manageSchema = true` requires recording its version first.
+Set `message_queue_schema_version` and `cron_schema_version` in the `<prefix>properties` table (`key VARCHAR(32) PRIMARY KEY, value TEXT`) to the versions applied.
+Otherwise KCPT sees version 0 and re-runs `CREATE TABLE` against tables that already exist.
+====
+
+
 === JVM
 
 KCPT is a JVM-only library, built and tested against a Java 17 toolchain.
@@ -174,6 +209,7 @@ val sink = MessageQueueSink(
 ----
 
 Schema setup runs the first time it is actually needed, unless an `initializationScope` is passed to run it eagerly instead.
+Pass `manageSchema = false` to leave the tables to the application instead (see <<managing-the-schema-yourself>>).
 `sink.messageQueue(name, serializer, config, messageObservers)` returns a `MessageQueue<T>` for one named queue, sharing the sink's tables and `Source`.
 
 
@@ -386,6 +422,7 @@ val cleanup = cronSink.cron(
 ----
 
 `startAt` and `runImmediately` only matter the first time a given name is ever registered — after that, restarting the application resumes whatever progress is already stored.
+Like `MessageQueueSink`, `CronSink` takes `initializationScope` to run schema setup eagerly and `manageSchema = false` to leave the tables to the application (see <<managing-the-schema-yourself>>).
 
 
 === `Cron.Config`
@@ -534,16 +571,16 @@ Both documents' own "Guarantees and non-guarantees" sections (xref:docs/message-
 | Module | Contents
 
 | `kcpt-core`
-| `Source`, `PGChannel`, the shared properties-table mechanism, the `@InternalKcptApi` marker.
+| `Source`, `PGChannel`, `SchemaMigration`, the shared properties-table mechanism, the `@InternalKcptApi` marker.
 No dependency on either feature module.
 
 | `kcpt-message-queue`
-| `MessageQueueSink`, `MessageQueue<T>`, `Message<T>`, `workerPool`.
+| `MessageQueueSink`, `MessageQueueSchema`, `MessageQueue<T>`, `Message<T>`, `workerPool`.
 Depends on `kcpt-core`.
 See xref:docs/message-queue-algorithm.adoc[the algorithm doc] for the full design.
 
 | `kcpt-cron`
-| `CronSink`, `Cron`.
+| `CronSink`, `CronSchema`, `Cron`.
 Depends on `kcpt-core`.
 See xref:docs/cron-algorithm.adoc[the algorithm doc] for the full design.
 |===

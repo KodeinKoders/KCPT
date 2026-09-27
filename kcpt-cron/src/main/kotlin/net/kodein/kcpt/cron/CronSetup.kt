@@ -5,6 +5,7 @@ package net.kodein.kcpt.cron
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.kodein.kcpt.Property
+import net.kodein.kcpt.SchemaMigration
 import net.kodein.kcpt.Source
 import net.kodein.kcpt.getProperty
 import net.kodein.kcpt.setProperty
@@ -76,6 +77,18 @@ internal object CronSetup {
         ),
     )
 
+    internal val version: Int get() = cronMigrations.size
+
+    // The rendering both paths share: what this object runs when managing the schema itself is,
+    // statement for statement, what the public schema object hands out for someone else to run.
+    internal fun migrations(tables: CronTables): List<SchemaMigration> =
+        cronMigrations.mapIndexed { index, step ->
+            SchemaMigration(
+                toVersion = index + 1,
+                statements = step.map { sql -> sql(tables).trimIndent() },
+            )
+        }
+
     // Independent of MessageQueueSetup's own lock: a MessageQueueSink and a CronSink initialising
     // concurrently on the same prefix must not contend on each other's lock, since neither
     // touches the other's table.
@@ -98,8 +111,8 @@ internal object CronSetup {
                     statement.execute()
                 }
 
-                val targetVersion = cronMigrations.size
-                var currentVersion = getProperty(cronSchemaVersion) ?: 0
+                val targetVersion = version
+                val currentVersion = getProperty(cronSchemaVersion) ?: 0
 
                 // Same rolling-deployment rationale as MessageQueueSetup.initializeMQSchema's own check.
                 check(currentVersion <= targetVersion) {
@@ -108,12 +121,11 @@ internal object CronSetup {
                         "by a newer release and cannot be used by this one"
                 }
 
-                while (currentVersion < targetVersion) {
-                    cronMigrations[currentVersion].forEach { sql ->
-                        prepareStatement(sql(tables).trimIndent()).use { it.execute() }
+                migrations(tables).drop(currentVersion).forEach { migration ->
+                    migration.statements.forEach { sql ->
+                        prepareStatement(sql).use { it.execute() }
                     }
-                    ++currentVersion
-                    setProperty(cronSchemaVersion, currentVersion)
+                    setProperty(cronSchemaVersion, migration.toVersion)
                 }
             }
         }

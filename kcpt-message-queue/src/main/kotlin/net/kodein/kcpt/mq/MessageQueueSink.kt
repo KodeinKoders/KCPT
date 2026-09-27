@@ -21,6 +21,9 @@ public fun MessageQueueSink(
     source: Source,
     tablesPrefix: String = "public.kcpt_",
     initializationScope: CoroutineScope? = null,
+    // false leaves creating and migrating the tables to the application — see MessageQueueSchema
+    // for the DDL to apply. initialize() then does nothing, and the properties table is never used.
+    manageSchema: Boolean = true,
     messageObservers: List<Message.Observer<Any?>> = emptyList(),
     // Told about a notification on a queue's channel whose payload could not be read. Such a
     // notification is dropped — it is only ever a hint that work may be available — so without this
@@ -32,6 +35,7 @@ public fun MessageQueueSink(
     source = source,
     tablesPrefix = tablesPrefix,
     initializationScope = initializationScope,
+    manageSchema = manageSchema,
     messageObservers = messageObservers,
     onUndecodableNotification = onUndecodableNotification,
 )
@@ -40,17 +44,15 @@ internal class MessageQueueSinkImpl(
     private val source: Source,
     tablesPrefix: String,
     initializationScope: CoroutineScope?,
+    manageSchema: Boolean,
     private val messageObservers: List<Message.Observer<Any?>>,
     private val onUndecodableNotification:
         (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
 ) : MessageQueueSink {
-    private val tables = MessageQueueTables.named(
-        properties = "${tablesPrefix}properties",
-        messages = "${tablesPrefix}messages",
-    )
+    private val tables = MessageQueueTables.fromPrefix(tablesPrefix)
 
     private val initializer = OnceInitializer(initializationScope) {
-        context(tables) { MessageQueueSetup.initializeMQSchema(source) }
+        if (manageSchema) context(tables) { MessageQueueSetup.initializeMQSchema(source) }
     }
 
     override suspend fun initialize() = initializer.initialize()

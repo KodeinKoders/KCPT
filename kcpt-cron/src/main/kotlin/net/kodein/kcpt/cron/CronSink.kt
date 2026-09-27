@@ -28,25 +28,26 @@ public fun CronSink(
     source: Source,
     tablesPrefix: String = "public.kcpt_",
     initializationScope: CoroutineScope? = null,
+    // false leaves creating and migrating the tables to the application — see CronSchema for the
+    // DDL to apply. initialize() then does nothing, and the properties table is never used.
+    manageSchema: Boolean = true,
 ): CronSink = CronSinkImpl(
     source = source,
     tablesPrefix = tablesPrefix,
     initializationScope = initializationScope,
+    manageSchema = manageSchema,
 )
 
 internal class CronSinkImpl(
     private val source: Source,
     tablesPrefix: String,
     initializationScope: CoroutineScope?,
+    manageSchema: Boolean,
 ) : CronSink {
-    private val tables = CronTables.named(
-        properties = "${tablesPrefix}properties",
-        crons = "${tablesPrefix}crons",
-        cronTicks = "${tablesPrefix}cron_ticks",
-    )
+    private val tables = CronTables.fromPrefix(tablesPrefix)
 
     private val initializer = OnceInitializer(initializationScope) {
-        context(tables) { CronSetup.initializeCronSchema(source) }
+        if (manageSchema) context(tables) { CronSetup.initializeCronSchema(source) }
     }
 
     override suspend fun initialize() = initializer.initialize()

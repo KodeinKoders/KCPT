@@ -5,6 +5,7 @@ package net.kodein.kcpt.mq
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.kodein.kcpt.Property
+import net.kodein.kcpt.SchemaMigration
 import net.kodein.kcpt.Source
 import net.kodein.kcpt.getProperty
 import net.kodein.kcpt.setProperty
@@ -87,6 +88,18 @@ internal object MessageQueueSetup {
     )
 
 
+    internal val version: Int get() = mqMigrations.size
+
+    // The rendering both paths share: what this object runs when managing the schema itself is,
+    // statement for statement, what the public schema object hands out for someone else to run.
+    internal fun migrations(tables: MessageQueueTables): List<SchemaMigration> =
+        mqMigrations.mapIndexed { index, step ->
+            SchemaMigration(
+                toVersion = index + 1,
+                statements = step.map { sql -> sql(tables).trimIndent() },
+            )
+        }
+
     // A database-wide key, so every process initialising the same tables contends on the same
     // lock. String.hashCode is specified by the JDK, so separate JVMs derive the same value.
     context(tables: MessageQueueTables)
@@ -111,8 +124,8 @@ internal object MessageQueueSetup {
                     statement.execute()
                 }
 
-                val targetVersion = mqMigrations.size
-                var currentVersion = getProperty(messageQueueSchemaVersion) ?: 0
+                val targetVersion = version
+                val currentVersion = getProperty(messageQueueSchemaVersion) ?: 0
 
                 // A version beyond what this build knows how to migrate to means the tables were
                 // migrated by a newer release. The loop below would simply not run and report
@@ -126,12 +139,11 @@ internal object MessageQueueSetup {
                         "a newer release and cannot be used by this one"
                 }
 
-                while (currentVersion < targetVersion) {
-                    mqMigrations[currentVersion].forEach { sql ->
-                        prepareStatement(sql(tables).trimIndent()).use { it.execute() }
+                migrations(tables).drop(currentVersion).forEach { migration ->
+                    migration.statements.forEach { sql ->
+                        prepareStatement(sql).use { it.execute() }
                     }
-                    ++currentVersion
-                    setProperty(messageQueueSchemaVersion, currentVersion)
+                    setProperty(messageQueueSchemaVersion, migration.toVersion)
                 }
             }
         }

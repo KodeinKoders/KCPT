@@ -11,6 +11,8 @@ import net.kodein.kcpt.mq.User
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
@@ -189,5 +191,57 @@ class CronSchemaSetupTest : AbstractPgsqlTest() {
         cronSink.cron("probe", defaultConfig())
         val mq = messageQueueSink.messageQueue(uniqueQueueName(), User.serializer())
         mq.post(User(1, "A"))
+    }
+
+    private fun tableExists(table: String): Boolean = dataSource.connection.use { connection ->
+        connection.prepareStatement("SELECT to_regclass(?) IS NOT NULL").use { statement ->
+            statement.setString(1, table)
+            statement.executeQuery().use { resultSet -> resultSet.next() && resultSet.getBoolean(1) }
+        }
+    }
+
+    private fun applyManually(prefix: String) = dataSource.connection.use { connection ->
+        CronSchema.migrations(prefix).forEach { migration ->
+            migration.statements.forEach { sql -> connection.prepareStatement(sql).use { it.execute() } }
+        }
+    }
+
+    @Test
+    fun aCronSinkNotManagingItsSchemaCreatesNoTable() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        CronSink(source = dataSource.asSource(), tablesPrefix = prefix, manageSchema = false).initialize()
+
+        for (table in listOf("crons", "cron_ticks", "properties")) {
+            assertFalse(tableExists("$prefix$table"), "the $table table must be left to the application")
+        }
+    }
+
+    @Test
+    fun aCronSinkNotManagingItsSchemaWorksOnTheTablesThePublishedMigrationsCreate() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        applyManually(prefix)
+
+        val sink = CronSink(source = dataSource.asSource(), tablesPrefix = prefix, manageSchema = false)
+        sink.cron("probe", defaultConfig())
+        assertNotNull(dataSource.cronNextSlotAtOf(prefix, "probe"), "registering must have written the cursor row")
+        assertFalse(tableExists("${prefix}properties"))
+    }
+
+    @Test
+    fun thePublishedCronMigrationsReachTheVersionAutomaticSetupRecords() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        CronSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
+
+        val migrations = CronSchema.migrations(prefix)
+        assertEquals(CronSchema.version, migrations.size)
+        assertEquals((1..migrations.size).toList(), migrations.map { it.toVersion })
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'cron_schema_version'").use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    assertTrue(resultSet.next())
+                    assertEquals(migrations.last().toVersion.toString(), resultSet.getString(1))
+                }
+            }
+        }
     }
 }

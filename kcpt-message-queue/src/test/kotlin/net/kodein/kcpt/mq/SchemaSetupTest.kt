@@ -16,6 +16,7 @@ import net.kodein.kcpt.setProperty
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -262,5 +263,59 @@ class SchemaSetupTest : AbstractPgsqlTest() {
             "not-a-number" in (failure.message ?: ""),
             "the failure must name the offending value; message was: ${failure.message}",
         )
+    }
+
+    private fun tableExists(table: String): Boolean = dataSource.connection.use { connection ->
+        connection.prepareStatement("SELECT to_regclass(?) IS NOT NULL").use { statement ->
+            statement.setString(1, table)
+            statement.executeQuery().use { resultSet -> resultSet.next() && resultSet.getBoolean(1) }
+        }
+    }
+
+    private fun applyManually(prefix: String) = dataSource.connection.use { connection ->
+        MessageQueueSchema.migrations(prefix).forEach { migration ->
+            migration.statements.forEach { sql -> connection.prepareStatement(sql).use { it.execute() } }
+        }
+    }
+
+    @Test
+    fun aSinkNotManagingItsSchemaCreatesNoTable() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix, manageSchema = false)
+        sink.initialize()
+        sink.messageQueue(uniqueQueueName(), User.serializer())
+
+        assertFalse(tableExists("${prefix}messages"), "the messages table must be left to the application")
+        assertFalse(tableExists("${prefix}properties"), "the properties table is only ever for KCPT's own migrations")
+    }
+
+    @Test
+    fun aSinkNotManagingItsSchemaWorksOnTheTablesThePublishedMigrationsCreate() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        applyManually(prefix)
+
+        val sink = MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix, manageSchema = false)
+        val mq = sink.messageQueue(uniqueQueueName(), User.serializer())
+        mq.post(User(1, "A"))
+        assertEquals(User(1, "A"), assertNotNull(mq.tryReceive()).payload)
+        assertFalse(tableExists("${prefix}properties"))
+    }
+
+    @Test
+    fun thePublishedMigrationsReachTheVersionAutomaticSetupRecords() = runTest(timeout = 5.seconds) {
+        val prefix = uniquePrefix()
+        MessageQueueSink(source = dataSource.asSource(), tablesPrefix = prefix).initialize()
+
+        val migrations = MessageQueueSchema.migrations(prefix)
+        assertEquals(MessageQueueSchema.version, migrations.size)
+        assertEquals((1..migrations.size).toList(), migrations.map { it.toVersion })
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("SELECT value FROM ${prefix}properties WHERE key = 'message_queue_schema_version'").use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    assertTrue(resultSet.next())
+                    assertEquals(migrations.last().toVersion.toString(), resultSet.getString(1))
+                }
+            }
+        }
     }
 }
