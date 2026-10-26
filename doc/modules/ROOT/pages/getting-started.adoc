@@ -1,0 +1,92 @@
+= Getting started
+
+This page takes a JVM project from nothing to a working message queue and a working cron.
+It needs a PostgreSQL server you can connect to.
+
+1. Add the dependencies:
++
+[source,kotlin,subs="verbatim,attributes"]
+.build.gradle.kts
+----
+plugins {
+    kotlin("jvm") version "{kotlin-version}"
+    kotlin("plugin.serialization") version "{kotlin-version}" // <1>
+}
+
+dependencies {
+    implementation("net.kodein.kcpt:kcpt-message-queue:{version}")
+    implementation("net.kodein.kcpt:kcpt-cron:{version}")
+    implementation("com.zaxxer:HikariCP:{hikaricp-version}") // <2>
+    implementation("org.postgresql:postgresql:42.7.13") // <3>
+}
+----
+<1> The payload of a message is serialized to JSON with `kotlinx.serialization`.
+<2> Any `javax.sql.DataSource` works; HikariCP is only an example.
+<3> KCPT does not bring a JDBC driver to your classpath: use the one your application already has.
+
+2. Create a `Source`, the way KCPT gets its connections:
++
+--
+[source,kotlin]
+.Main.kt
+----
+val dataSource = HikariDataSource(HikariConfig().apply {
+    jdbcUrl = "jdbc:postgresql://localhost:5432/mydb"
+    username = "postgres"
+    password = "postgres"
+})
+val source: Source = dataSource.asSource()
+----
+
+KCPT creates its own tables the first time it needs them.
+--
+
+3. Declare a payload, and post it:
++
+[source,kotlin]
+.Main.kt
+----
+@Serializable
+data class EmailJob(val to: String, val subject: String)
+
+val sink = MessageQueueSink(source)
+val emails = sink.messageQueue("emails", EmailJob.serializer()) // <1>
+
+emails.post(EmailJob(to = "user@example.com", subject = "Welcome"))
+----
+<1> A queue is identified by its name: producers and consumers, in any process, meet on it.
+
+4. Consume the messages:
++
+--
+[source,kotlin]
+.Main.kt
+----
+emails.workerPool { message -> // <1>
+    sendEmail(message.payload)
+    null // <2>
+}
+----
+<1> Suspends forever, handling messages as they arrive: launch it in a coroutine of its own.
+<2> The notes to record alongside a success: `null` for none.
+
+If the lambda throws, the message is retried; after too many failures it is dead-lettered.
+--
+
+5. Run a cron:
++
+[source,kotlin]
+.Main.kt
+----
+val cronSink = CronSink(source)
+val cleanup = cronSink.cron("cleanup", Cron.Config(interval = 10.minutes))
+
+cleanup.run { from, to -> // <1>
+    deleteOldRecords(before = to)
+    null
+}
+----
+<1> Start the same code on as many servers as you like: each window is handed to exactly one of them.
+
+That's it!
+From here, xref:queue:message-queue.adoc[] and xref:cron:cron.adoc[] explain each feature in depth.

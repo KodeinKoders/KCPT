@@ -1,0 +1,73 @@
+= Receiving messages
+
+A consumer receives a message under a lease: it is the only one to hold it, until the lease ends or expires.
+This page covers the receiving calls and the `Message<T>` they hand back; ending the lease is the subject of xref:processing.adoc[].
+
+
+== Receiving
+
+[cols="1,3"]
+|===
+| Member | Purpose
+
+| `suspend fun tryReceive(): Message<T>?`
+| One attempt: a leased message, or `null` if none is available right now.
+
+| `suspend fun receive(): Message<T>`
+| Suspends until a message can be leased, woken by `LISTEN`/`NOTIFY` the instant one is posted.
+
+| `fun receiver(scope: CoroutineScope): Receiver<T>`
+| A `receive()` that shares one listening connection across many calls — what xref:worker-pool.adoc[] uses underneath.
+|===
+
+[source,kotlin]
+.Main.kt
+----
+val message: Message<EmailJob> = emails.receive()
+println("Sending ${message.payload.subject} to ${message.payload.to}")
+----
+
+A `Receiver` is closed when you are done with it, since it holds a connection:
+
+[source,kotlin]
+.Main.kt
+----
+emails.receiver(scope).use { receiver ->
+    while (true) {
+        val message = receiver.receiveNext()
+        // ...
+    }
+}
+----
+
+
+== `Message<T>`
+
+`tryReceive()` and `receive()` hand back a leased `Message<T>`.
+It carries the payload, the lease's own timing, and every failed attempt so far:
+
+[cols="1,3"]
+|===
+| Member | Purpose
+
+| `val id: Uuid`
+| The message's identity.
+
+| `val payload: T`
+| The decoded value passed to `post()`.
+
+| `val receivedAt: Instant`
+| When this lease was taken.
+
+| `val expiresAt: Instant`
+| When this lease nominally ends — moved forward by `extend()`.
+Reclaimable by another consumer once `expiresAt + processingGrace` has passed, not at `expiresAt` itself.
+
+| `val processingGrace: Duration`
+| The queue's own reclaim margin.
+
+| `val notes: List<JsonElement>`
+| Every note recorded by a previous failed attempt, oldest first.
+|===
+
+It is your job to end that lease, one way or another, before moving on: automatically through xref:processing.adoc[`process()`], or by calling one of ``Message<T>``'s own methods directly (see xref:manual-processing.adoc[]).

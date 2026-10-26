@@ -1,0 +1,47 @@
+name: publish documentation
+
+# Only ever run on demand: by hand from the Actions tab, or by the release workflow once it has
+# moved the release's vX.Y branch. The site is built from every vX.Y branch, one version each.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Create a local branch for each release branch
+        # Antora reads the local branches of the repository, and a checkout only has the one it is on.
+        run: git fetch origin 'refs/heads/v*:refs/heads/v*' --update-head-ok
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Install Antora
+        run: npm install
+      - name: Generate the site
+        run: npx antora antora-playbook.yml
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

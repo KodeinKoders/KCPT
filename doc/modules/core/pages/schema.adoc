@@ -1,0 +1,68 @@
+= The schema
+
+KCPT keeps its state in a few tables of your PostgreSQL database.
+This page covers where they live, how they are created, and how to take that over.
+
+
+== Tables and their prefix
+
+Both sinks take a `tablesPrefix`, `"public.kcpt_"` by default, which is prepended to the name of each table they use.
+It may carry a schema (`"jobs.kcpt_"`), and is validated: an identifier made of letters, digits, underscores and dollar signs, optionally qualified by a schema, not starting with a digit.
+
+A message queue and a cron create their own tables independently, but share one `properties` table, in which each tracks its own schema version separately.
+
+
+== Automatic setup
+
+``MessageQueueSink``'s and ``CronSink``'s schema setup each run once per process, lazily on first use, under their own advisory lock.
+Two processes, or two sinks in the same process, starting up at once never race each other into a duplicate `CREATE TABLE`.
+
+Pass an `initializationScope` to a sink to run the setup eagerly in that scope instead, or call `initialize()` yourself:
+
+[source,kotlin]
+.Main.kt
+----
+val sink = MessageQueueSink(
+    source = source,
+    initializationScope = applicationScope, // <1>
+)
+sink.initialize() // <2>
+----
+<1> Starts the schema setup right away, in the background.
+<2> Suspends until the schema is ready.
+
+
+[#managing-the-schema-yourself]
+== Managing the schema yourself
+
+An application that manages its DDL some other way — Flyway, Liquibase, a DBA-reviewed script — can pass `manageSchema = false` to either sink.
+`initialize()` then does nothing: KCPT never creates, migrates or checks a table, and never touches the `properties` table.
+
+The exact statements the sinks would otherwise run are public, rendered for a given prefix:
+
+[source,kotlin]
+.Main.kt
+----
+val migrations: List<SchemaMigration> = MessageQueueSchema.migrations(tablesPrefix = "public.kcpt_") // <1>
+migrations.drop(appliedVersion).forEach { migration ->
+    println("-- to version ${migration.toVersion}")
+    println(migration.script) // <2>
+}
+
+val sink = MessageQueueSink(
+    source = source,
+    tablesPrefix = "public.kcpt_",
+    manageSchema = false,
+)
+----
+<1> `CronSchema.migrations(tablesPrefix)` is the cron counterpart; `MessageQueueSchema.version` and `CronSchema.version` give the version this release expects.
+<2> `statements` holds the same DDL as one statement per entry.
+
+These scripts are pure DDL: they carry none of KCPT's own version bookkeeping, since that bookkeeping only exists for the sinks' automatic migration.
+
+[IMPORTANT]
+====
+Switching a schema managed this way back to `manageSchema = true` requires recording its version first.
+Set `message_queue_schema_version` and `cron_schema_version` in the `<prefix>properties` table (`key VARCHAR(32) PRIMARY KEY, value TEXT`) to the versions applied.
+Otherwise KCPT sees version 0 and re-runs `CREATE TABLE` against tables that already exist.
+====

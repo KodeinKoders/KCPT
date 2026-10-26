@@ -1,0 +1,5 @@
+.Cron
+* xref:cron.adoc[]
+** xref:cron.adoc#config[Configuration]
+* xref:running.adoc[]
+** xref:running.adoc#shorten-window[Shortening a window]

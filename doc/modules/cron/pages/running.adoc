@@ -1,0 +1,103 @@
+= Running a cron
+
+`Cron.run()` is the loop that waits for windows and hands them to your handler.
+Call it once per server: every server calling `run()` runs the identical loop, and there is no leader.
+
+[source,kotlin]
+.Main.kt
+----
+cleanup.run { from, to -> // <1>
+    deleteOldRecords(before = to)
+    null // <2>
+}
+----
+<1> The window `[from, to)` that this tick is responsible for.
+<2> The notes to record alongside a success: `null` for none.
+
+`run()` never returns: cancel its coroutine to shut a server down.
+If the handler throws, the window is retried, up to `retries`, then dead-lettered without blocking the windows after it.
+
+TIP: Be idempotent: if a handler succeeds but the write-back recording it fails, its lease eventually expires and the window runs again.
+See xref:guides:guarantees.adoc[].
+
+
+== Parameters
+
+[source,kotlin]
+----
+public suspend fun run(
+    timeout: Duration = config.tickTimeout,
+    shortenWindow: suspend (from: Instant, defaultTo: Instant) -> Instant = { _, defaultTo -> defaultTo },
+    onSuccess: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
+    onFailure: (failure: CronTickFailure) -> JsonElement = { JsonObject(it.defaultNotes()) },
+    onDeadLetter: (from: Instant, to: Instant, notes: JsonElement) -> Unit = { _, _, _ -> },
+    onError: (cause: Throwable) -> Unit = {},
+    tick: suspend (from: Instant, to: Instant) -> JsonElement?,
+): Nothing
+----
+
+[cols="1,3"]
+|===
+| Parameter | Meaning
+
+| `timeout`
+| Bounds the tick.
+Freely longer than `tickTimeout`, since a tick's lease is kept alive automatically whenever it genuinely needs one: no parameter to configure, and nothing to misconfigure (see xref:internals:cron-algorithm.adoc#corner-timeout-above-lease[]).
+
+| `shortenWindow`
+| Lets a server end a steady-state window earlier than its nominal boundary.
+See <<shorten-window>>.
+
+| `onSuccess`
+| Called after a window's tick succeeded and was recorded.
+
+| `onFailure`
+| Produces the notes recorded when a tick fails: `CronTickFailure` is one of `Exception`, `Timeout` or `Cancellation`.
+
+| `onDeadLetter`
+| Called when a window has used up its `retries` and is dead-lettered.
+
+| `onError`
+| Reports an infrastructure failure — a dropped connection, an exhausted pool, a tick whose lease had already expired before it could even start — in the materialize, lease and write-back queries themselves.
+Distinct from `onFailure`, which reports the handler's own failures.
+`run()` backs off and keeps going.
+|===
+
+[source,kotlin]
+.Main.kt
+----
+cleanup.run(
+    onDeadLetter = { from, to, notes -> alerts.send("cleanup $from..$to gave up: $notes") },
+    onError = { cause -> logger.warn("cleanup cron infrastructure error", cause) },
+) { from, to ->
+    deleteOldRecords(before = to)
+    null
+}
+----
+
+
+[#shorten-window]
+== Shortening a window
+
+`shortenWindow` lets whichever server wins the materialize race for a steady-state window end it earlier than its nominal boundary.
+It is given the window's `from` and the default `to`, and returns the `to` to use:
+
+[source,kotlin]
+.Main.kt
+----
+cleanup.run(
+    shortenWindow = { from, defaultTo ->
+        if (pendingDeletions() > 100_000) minOf(defaultTo, from + 1.minutes) else defaultTo // <1>
+    },
+) { from, to ->
+    deleteOldRecords(from = from, before = to)
+    null
+}
+----
+<1> A busy backlog is worked in smaller windows.
+
+The window can only ever come out smaller than expected, never larger: a later instant is silently clamped.
+The function is never consulted for a catch-up chunk.
+It runs inside the materialization transaction, so keep it quick.
+
+See xref:internals:cron-algorithm.adoc#job-1-materialize[] for the full contract.

@@ -1,0 +1,79 @@
+= The cron
+
+A cron fires a *tick* — one call to your handler — for a *window*, a time range the size of `interval`.
+This page covers how to register a cron and configure it; xref:running.adoc[] explains how to run it.
+
+
+== Windows
+
+A window is `[from, to)` by default (`to` excluded), or `(from, to]` (`to` included) with `Cron.Config.windowEnd` set to `WindowEnd.INCLUSIVE`.
+It is *materialized* — turned from pure arithmetic on a schedule into an actual claimable row — once it has fully elapsed, then leased and run exactly like a message.
+
+Windows are contiguous and non-overlapping, and anchored to the clock: a window is never shifted by how long a handler takes to run.
+
+
+== `CronSink`
+
+The entry point is a `CronSink`:
+
+[source,kotlin]
+.Main.kt
+----
+val cronSink = CronSink(
+    source = source,
+    tablesPrefix = "public.kcpt_", // <1>
+)
+
+val cleanup = cronSink.cron(
+    name = "cleanup", // <2>
+    config = Cron.Config(interval = 10.minutes),
+    startAt = Clock.System.now(), // <3>
+    runImmediately = false, // <3>
+)
+----
+<1> The default.
+<2> Every server registering the same name shares the same cron.
+<3> The defaults.
+
+`startAt` and `runImmediately` only matter the first time a given name is ever registered.
+After that, restarting the application resumes whatever progress is already stored.
+
+Like `MessageQueueSink`, `CronSink` takes `initializationScope` to run schema setup eagerly, and `manageSchema = false` to leave the tables to the application (see xref:core:schema.adoc#managing-the-schema-yourself[]).
+
+
+[#config]
+== Configuration
+
+[cols="1,2,3"]
+|===
+| Field | Default | Meaning
+
+| `interval`
+| _(required)_
+| The wall-clock cadence: how wide one window is.
+
+| `maxInterval`
+| `interval * 50`
+| The widest a single catch-up window may be, after downtime.
+
+| `retries`
+| `5`
+| Failed attempts, including reclaims, before a window is dead-lettered.
+
+| `tickTimeout`
+| `interval`
+| How long a lease is held before another server may reclaim it.
+
+| `tickGrace`
+| `max(tickTimeout * .2, 200ms)`
+| Extra margin before a reclaim, so a handler's own timeout always fires first.
+
+| `windowEnd`
+| `WindowEnd.EXCLUSIVE`
+| Which side of a window owns the boundary it shares with the next one: `EXCLUSIVE` for `[from, to)`, `INCLUSIVE` for `(from, to]`.
+See xref:internals:cron-algorithm.adoc#job-1-materialize[the algorithm document] — it changes less than it sounds like.
+|===
+
+An invalid combination is rejected when the `Config` is built: a non-positive `interval` or `tickTimeout`, a `maxInterval` below `interval`, negative `retries`, or a `tickGrace` under 200 milliseconds.
+
+After downtime, a cron catches up in chunks of at most `maxInterval` rather than firing one tick per missed interval.

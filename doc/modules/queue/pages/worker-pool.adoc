@@ -1,0 +1,53 @@
+= The worker pool
+
+`workerPool` is the ready-made consumer loop: receive, dispatch, repeat, forever, across a fixed thread pool with a bounded number of concurrently in-flight messages.
+
+[source,kotlin]
+.Main.kt
+----
+emails.workerPool(
+    numberOfThreads = 8, // <1>
+    numberOfWorkers = 32, // <2>
+) { message ->
+    sendEmail(message.payload)
+    null // <3>
+}
+----
+<1> Size of the dedicated thread pool the handlers run on; the number of available processors by default.
+<2> How many messages may be in flight at once; four times the number of threads by default.
+<3> The notes to record alongside a success: `null` for none.
+
+Each message goes through xref:processing.adoc[`process()`], so a failure is requeued and a slow handler keeps its lease.
+
+`workerPool` never returns: cancel its coroutine to shut it down.
+
+[source,kotlin]
+.Main.kt
+----
+val consumer = scope.launch {
+    emails.workerPool { message -> sendEmail(message.payload); null }
+}
+
+// On shutdown
+consumer.cancelAndJoin()
+----
+
+
+== Reporting problems
+
+[cols="1,3"]
+|===
+| Parameter | Meaning
+
+| `timeout`
+| Passed to `process()` for each message; the queue's `processingTimeout` by default.
+
+| `onRequeueFailure`
+| Same as in xref:processing.adoc[`process()`]: the write-back of one message failed, and the message will be redelivered once its lease expires.
+
+| `onUnhandledFailure(message, cause)`
+| A failure `process()` itself never got the chance to handle — the already-expired-lease `IllegalStateException` it can throw before its own guarded region even begins, most concretely.
+It is reported here rather than cancelling the whole pool.
+|===
+
+TIP: The receive-then-dispatch ordering is deliberate: see xref:internals:message-queue-algorithm.adoc#the-worker-pool[].

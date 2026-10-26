@@ -1,0 +1,37 @@
+= Notification channels
+
+`PGChannel<T>` is the `LISTEN`/`NOTIFY` primitive both feature modules build on.
+It is the one piece of `kcpt-core` that is genuinely public API rather than internal plumbing.
+
+Reach for it directly to build a notification channel of your own on the same database, alongside a message queue or a cron.
+
+
+== A channel
+
+[source,kotlin]
+----
+public class PGChannel<T>(
+    public val name: String,
+    private val serializer: KSerializer<T>,
+    private val onUndecodableNotification: (channel: String, payload: String, cause: Throwable) -> Unit = { _, _, _ -> },
+) {
+    public suspend fun openListenConnection(scope: CoroutineScope, source: Source): ConnectionFlow<T>
+    public suspend fun notify(connection: Connection, value: T)
+}
+----
+
+A `ConnectionFlow<T>` is collected once, for as long as notifications are wanted.
+It shares one listening connection across every wait, rather than opening a new one per call.
+
+`onUndecodableNotification` is told about a notification whose payload could not be read.
+Such a notification is dropped: it is only ever a hint that work may be available.
+
+
+[#internal-api]
+== `@InternalKcptApi`
+
+A handful of declarations — the JDBC transaction helper, the properties-table mechanism, the schema-init coalescing helper, the JSON codec the two feature modules share — have to be `public` so `kcpt-message-queue` and `kcpt-cron` can see them across the module boundary, but were never meant for outside use.
+They are gated behind `@InternalKcptApi`, a `@RequiresOptIn` marker: using one without opting in is a compile error naming the annotation.
+
+Ordinary use of `kcpt-message-queue` or `kcpt-cron` never touches this surface.
+If the compiler ever asks for that opt-in, you have reached into cross-module plumbing rather than the library's intended public API.

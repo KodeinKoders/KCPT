@@ -1,0 +1,28 @@
+site:
+  title: KCPT Documentation
+  url: https://KodeinKoders.github.io/KCPT
+  start_page: kcpt::index.adoc
+  robots: allow
+  keys:
+    navbar_title: Kotlin Coroutines Postrgre Tasks
+    home_component: kcpt
+    github_url: https://github.com/KodeinKoders/KCPT
+    footer_text: 'KCPT &mdash; PostgreSQL-backed message queues and cron for Kotlin, by <a href="https://kodein-koders.com">Kodein Koders</a>.'
+content:
+  sources:
+    - url: ./
+      branches: 'v*'
+      start_path: doc
+ui:
+  bundle:
+    url: https://github.com/KodeinKoders/Antora-Kodein-UI/releases/download/v1.0.0/ui-bundle.zip
+  supplemental_files:
+    - path: ui.yml
+      contents: |
+        static_files: [ .nojekyll ]
+    - path: .nojekyll
+urls:
+  redirect_facility: 'static'
+  latest_version_segment: latest
+output:
+  dir: build/site

@@ -1,0 +1,6 @@
+.Core
+* xref:setup.adoc[]
+* xref:source.adoc[]
+* xref:schema.adoc[]
+** xref:schema.adoc#managing-the-schema-yourself[Managing the schema yourself]
+* xref:pgchannel.adoc[]

@@ -1,0 +1,96 @@
+= The message queue
+
+A message queue holds typed payloads that producers post and consumers receive, under a lease, with automatic retry.
+This page covers how to get one, and what you can do with it.
+
+
+== `MessageQueueSink`
+
+The entry point is a `MessageQueueSink` — one per application, or one per group of queues sharing a table prefix:
+
+[source,kotlin]
+.Main.kt
+----
+val sink = MessageQueueSink(
+    source = source,
+    tablesPrefix = "public.kcpt_", // <1>
+)
+----
+<1> The default.
+
+Schema setup runs the first time it is actually needed, unless an `initializationScope` is passed to run it eagerly instead.
+Pass `manageSchema = false` to leave the tables to the application instead (see xref:core:schema.adoc#managing-the-schema-yourself[]).
+Observers can be given to the whole sink with `messageObservers`; see xref:observers.adoc[].
+
+
+== A queue
+
+`sink.messageQueue(name, serializer, config, messageObservers)` returns a `MessageQueue<T>` for one named queue, sharing the sink's tables and `Source`:
+
+[source,kotlin]
+.Main.kt
+----
+@Serializable
+data class EmailJob(val to: String, val subject: String)
+
+val emails: MessageQueue<EmailJob> = sink.messageQueue(
+    name = "emails", // <1>
+    serializer = EmailJob.serializer(), // <2>
+)
+----
+<1> Producers and consumers, in any process, meet on this name.
+It is validated at construction: 1 to 32 characters.
+<2> The payload is stored as JSON.
+
+A message is posted with `post`, available immediately or at a later `due` instant:
+
+[source,kotlin]
+.Main.kt
+----
+emails.post(EmailJob(to = "user@example.com", subject = "Welcome"))
+emails.post(EmailJob(to = "user@example.com", subject = "How is it going?"), due = Clock.System.now() + 3.days)
+----
+
+Consumers then receive messages: see xref:receiving.adoc[].
+
+
+[#config]
+== Configuration
+
+`MessageQueue.Config` tunes the retry and lease behaviour of one queue:
+
+[source,kotlin]
+.Main.kt
+----
+val emails = sink.messageQueue(
+    name = "emails",
+    serializer = EmailJob.serializer(),
+    config = MessageQueue.Config(
+        maxTries = 3,
+        processingTimeout = 30.seconds,
+    ),
+)
+----
+
+[cols="1,2,3"]
+|===
+| Field | Default | Meaning
+
+| `maxTries`
+| `5`
+| Attempts, including reclaims, before a message is dead-lettered.
+
+| `securityCheckTimeout`
+| `10.minutes`
+| Backstop poll interval, for a message whose `NOTIFY` never arrived.
+
+| `processingTimeout`
+| `1.minute`
+| How long a lease is held before another consumer may reclaim it.
+
+| `processingGrace`
+| `max(processingTimeout * .2, 200ms)`
+| Extra margin before a reclaim, so a handler's own timeout always fires first.
+|===
+
+TIP: The reasoning behind the lease and its grace is in xref:internals:message-queue-algorithm.adoc[].

@@ -1,0 +1,52 @@
+= Contributing to KCPT
+:icons: font
+:source-highlighter: highlight.js
+
+== Project layout
+
+[cols="1,3"]
+|===
+| Module | Contents
+
+| `kcpt-core`
+| `Source`, `PGChannel`, `SchemaMigration`, the shared properties-table mechanism, the `@InternalKcptApi` marker.
+No dependency on either feature module.
+
+| `kcpt-message-queue`
+| `MessageQueueSink`, `MessageQueueSchema`, `MessageQueue<T>`, `Message<T>`, `workerPool`.
+Depends on `kcpt-core`.
+
+| `kcpt-cron`
+| `CronSink`, `CronSchema`, `Cron`.
+Depends on `kcpt-core`.
+|===
+
+
+== Building
+
+[source,bash]
+----
+./gradlew build                          # everything
+./gradlew :kcpt-core:test                # core's own tests
+./gradlew :kcpt-message-queue:test       # message queue tests
+./gradlew :kcpt-cron:test                # cron tests
+----
+
+Every test module runs against a real PostgreSQL instance via https://testcontainers.com/[Testcontainers], so a running Docker daemon is required to run the tests.
+Building without running tests needs nothing beyond a JDK.
+
+
+== Documentation
+
+The documentation is an https://antora.org[Antora] component in `doc/`, published as its own site on GitHub Pages.
+Build it locally with:
+
+[source,bash]
+----
+npm install
+npx antora antora-playbook.yml
+----
+
+The site is built from the `vX.Y` branches, one version each: the release workflow moves the branch of the release line, then runs the `publish documentation` workflow, which can also be run by hand from the Actions tab.
+Bumping the version for a release means bumping it in `doc/antora.yml` (`display_version` and the `version` attribute, plus `version` for a new release line) and in the `:version:` attribute of `README.adoc`, along with `build.gradle.kts`.
+Until the first `vX.Y` branch exists, the playbook has nothing to build: to preview the working tree, point a throwaway playbook at `branches: HEAD`.

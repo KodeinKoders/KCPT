@@ -1,0 +1,48 @@
+= Manual processing
+
+`Message<T>` exposes the calls that end a lease, so you can write the processing logic yourself.
+This page explains them, and why you should rarely need to.
+
+[WARNING]
+====
+Manually ending a message's lease is a delicate endeavor.
+Exactly one of `successDelete` / `failureRequeue` / `failureDelete` must be called per message, and `extend()` must be called before the lease expires if the work needs longer than `processingTimeout`.
+Every guarantee xref:processing.adoc[`process()`] provides — the correct write-back on every kind of failure, a lease kept alive automatically when the work needs more time, cancellation handled correctly — has to be reimplemented by hand.
+Do this only when xref:worker-pool.adoc[`workerPool`] and `process()` genuinely cannot be used.
+====
+
+
+== The calls
+
+[cols="1,3"]
+|===
+| Member | Purpose
+
+| `suspend fun successDelete(notes: JsonElement = JsonNull)`
+| The work succeeded: deletes the message, recording `notes` alongside the success.
+
+| `suspend fun failureRequeue(due: Instant? = null, notes: JsonElement = JsonNull)`
+| The work failed: clears the lease and makes the message due again at `due` (immediately, by default), recording `notes` as this attempt's failure.
+Defers to `failureDelete` instead when this was the last authorized attempt.
+
+| `suspend fun failureDelete(notes: JsonElement = JsonNull)`
+| Deletes the message and reports it as a failure, recording `notes` as the reason — regardless of how many tries remain.
+Call it directly to abandon a message outright, whatever `maxTries` still allows.
+
+| `suspend fun extend()`
+| Re-stamps the lease, pushing `expiresAt` forward by another `processingTimeout` — for a handler that needs longer than the lease to finish.
+|===
+
+[source,kotlin]
+.Main.kt
+----
+val message = emails.receive()
+try {
+    sendEmail(message.payload)
+    message.successDelete()
+} catch (e: Exception) {
+    message.failureRequeue(notes = JsonPrimitive(e.message))
+}
+----
+
+Getting this wrong — never calling any of the three, or calling one on a lease that has already expired — is exactly the failure mode `process()` exists to rule out.

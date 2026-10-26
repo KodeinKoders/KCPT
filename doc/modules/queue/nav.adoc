@@ -1,0 +1,8 @@
+.Message queue
+* xref:message-queue.adoc[]
+** xref:message-queue.adoc#config[Configuration]
+* xref:receiving.adoc[]
+* xref:processing.adoc[]
+* xref:worker-pool.adoc[]
+* xref:manual-processing.adoc[]
+* xref:observers.adoc[]

@@ -1,0 +1,35 @@
+= Guarantees
+
+What KCPT promises, and — as important — what it does not.
+Each line below is backed, safeguard by safeguard, by one of the xref:internals:message-queue-algorithm.adoc[internals] documents.
+
+
+== The message queue
+
+* Each message is held by at most one consumer at a time.
+* At-least-once delivery, retried until success or `maxTries`.
+* A crashed consumer's message is redelivered within `processingTimeout + processingGrace`.
+* A permanently failing message is dead-lettered rather than retried forever.
+* A consumer learns of a new message on commit, not on a poll interval.
+
+See xref:internals:message-queue-algorithm.adoc#guarantees[Guarantees and non-guarantees].
+
+
+== The cron
+
+* Each window is handed to at most one server at a time.
+* Windows are contiguous and non-overlapping.
+* Cadence follows the clock, not handler durations, as long as servers are available.
+* A crashed server's window is picked up by another within `tickTimeout + tickGrace`.
+* A permanently failing window is dead-lettered without blocking later windows.
+
+See xref:internals:cron-algorithm.adoc#guarantees[Guarantees and non-guarantees].
+
+
+== Not exactly-once
+
+CAUTION: Neither guarantees *exactly-once* execution.
+If a handler succeeds but the write-back recording it fails, the lease eventually expires and the work runs again.
+Handlers should be idempotent.
+
+Both documents' own "Guarantees and non-guarantees" sections list every non-guarantee and the corner case behind each one — FIFO ordering, completion order, clock skew, and more.

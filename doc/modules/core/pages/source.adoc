@@ -1,0 +1,35 @@
+= The database connection
+
+Neither feature module opens a database connection on its own.
+This page explains the one thing they ask of you instead.
+
+
+== A `Source`
+
+Both take a `Source` — literally `suspend () -> Connection` — and call it whenever they need a connection:
+
+[source,kotlin]
+----
+public typealias Source = suspend () -> Connection
+----
+
+`DataSource.asSource()` adapts any `javax.sql.DataSource` — HikariCP, or the pool your application already has:
+
+[source,kotlin]
+.Main.kt
+----
+val hikari = HikariDataSource(HikariConfig().apply {
+    jdbcUrl = "jdbc:postgresql://localhost:5432/mydb"
+    username = "postgres"
+    password = "postgres"
+})
+val source: Source = hikari.asSource()
+----
+
+A `Source` is what you pass to `MessageQueueSink` and `CronSink`: one per application is the usual case, sharing the pool the rest of your code uses.
+
+IMPORTANT: KCPT depends on the PostgreSQL JDBC driver internally, but does not expose it as part of its own API.
+Bring a driver and a connection pool the way your application already manages one.
+
+NOTE: A parked `receive()` — or a cron server waiting between ticks — listens for notifications on a connection of its own, for as long as it waits.
+Size your pool accordingly.

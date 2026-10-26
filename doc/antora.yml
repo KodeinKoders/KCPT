@@ -1,0 +1,20 @@
+name: kcpt
+title: KCPT
+version: '0.1'
+display_version: '0.1.0'
+nav:
+  - modules/ROOT/nav.adoc
+  - modules/core/nav.adoc
+  - modules/queue/nav.adoc
+  - modules/cron/nav.adoc
+  - modules/guides/nav.adoc
+  - modules/internals/nav.adoc
+asciidoc:
+  attributes:
+    version: '0.1.0'
+    kotlin-version: '2.4.20'
+    kotlinx-coroutines-version: '1.11.0'
+    kotlinx-serialization-version: '1.11.0'
+    hikaricp-version: '7.1.0'
+    testcontainers-version: '2.0.5'
+    jdk: '17'

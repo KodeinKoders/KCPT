@@ -1,0 +1,71 @@
+= Testing
+
+KCPT is a layer over PostgreSQL features, so its own tests run against a real PostgreSQL instance rather than a mock.
+This page shows the same approach for code that uses it.
+
+
+== A real database
+
+https://testcontainers.com/[Testcontainers] starts a PostgreSQL in Docker for the duration of the tests, so a running Docker daemon is required:
+
+[source,kotlin,subs="verbatim,attributes"]
+.build.gradle.kts
+----
+dependencies {
+    testImplementation("org.testcontainers:testcontainers-postgresql:{testcontainers-version}")
+    testImplementation("com.zaxxer:HikariCP:{hikaricp-version}")
+    testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:{kotlinx-coroutines-version}")
+}
+----
+
+[source,kotlin]
+.EmailQueueTest.kt
+----
+class EmailQueueTest {
+
+    companion object {
+        val postgres = PostgreSQLContainer("postgres:18.6-alpine").apply { start() } // <1>
+    }
+
+    private val dataSource = HikariDataSource().apply {
+        jdbcUrl = postgres.jdbcUrl
+        username = postgres.username
+        password = postgres.password
+    }
+
+    @Test
+    fun postedEmailIsReceived() = runTest {
+        val sink = MessageQueueSink(
+            source = dataSource.asSource(),
+            tablesPrefix = "public.t_${Uuid.random().toString().replace("-", "").take(12)}_", // <2>
+        )
+        val emails = sink.messageQueue("emails", EmailJob.serializer())
+
+        emails.post(EmailJob(to = "user@example.com", subject = "Welcome"))
+
+        val message = emails.receive()
+        assertEquals("Welcome", message.payload.subject)
+        message.successDelete()
+    }
+}
+----
+<1> One container for the whole test run.
+<2> A table prefix of its own gives each test a private queue: no cleanup between tests, and tests may run in parallel.
+
+
+== Time
+
+A queue or a cron is driven by the database's clock and by real waits, so a test that depends on a timeout or an interval should use short ones:
+
+[source,kotlin]
+.EmailQueueTest.kt
+----
+val emails = sink.messageQueue(
+    name = "emails",
+    serializer = EmailJob.serializer(),
+    config = MessageQueue.Config(processingTimeout = 1.seconds, maxTries = 2),
+)
+----
+
+Use `runTest(timeout = ...)` with a generous bound, and poll for a condition rather than sleeping for a fixed time.

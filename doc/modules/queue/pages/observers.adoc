@@ -1,0 +1,59 @@
+= Observing outcomes
+
+A `Message.Observer` is told when a message ends, successfully or not, without being part of the handler.
+It is the place to count, log or alert.
+
+[source,kotlin]
+----
+public interface Observer<in T> {
+    public fun onSuccess(id: Uuid, payload: T, notes: JsonElement)
+    public fun onFailure(id: Uuid, payload: T, notes: JsonElement)
+    public fun onUndecodable(id: Uuid, payloadJson: String, notes: JsonElement) {}
+}
+----
+
+[cols="1,3"]
+|===
+| Callback | Called when
+
+| `onSuccess`
+| A message is deleted with `successDelete`, which `process()` does when its handler returns.
+
+| `onFailure`
+| A message is deleted as a failure: `failureDelete`, a `failureRequeue` on the last authorized attempt, or a reclaim that exhausts `maxTries`.
+In other words, a message is dead-lettered.
+
+| `onUndecodable`
+| A message was dropped because its payload could not be decoded.
+There is no `T` to report, so the raw JSON is given instead.
+|===
+
+Give observers to one queue, or to the whole sink:
+
+[source,kotlin]
+.Main.kt
+----
+val deadLetters = object : Message.Observer<EmailJob> {
+    override fun onSuccess(id: Uuid, payload: EmailJob, notes: JsonElement) {}
+    override fun onFailure(id: Uuid, payload: EmailJob, notes: JsonElement) {
+        logger.error("Email to ${payload.to} gave up: $notes")
+    }
+}
+
+val emails = sink.messageQueue(
+    name = "emails",
+    serializer = EmailJob.serializer(),
+    messageObservers = listOf(deadLetters), // <1>
+)
+----
+<1> `MessageQueueSink(messageObservers = ...)` takes `Message.Observer<Any?>` instead, and sees the messages of every queue.
+
+An observer runs after the outcome is already written.
+One that throws never reaches the caller and never hides the observers behind it.
+
+
+== Undecodable notifications
+
+A `NOTIFY` on a queue's channel whose payload cannot be read is dropped, since it is only ever a hint.
+Without a hook, nothing would report that a producer writes a format your consumers cannot read, so `MessageQueueSink` takes `onUndecodableNotification(channel, payload, cause)`.
+The channel name embeds the queue name, so one handler can tell queues apart.

@@ -1,0 +1,71 @@
+= KCPT
+
+[.lead]
+PostgreSQL-backed message queues and cron for Kotlin coroutines — no broker, no scheduler daemon, just the database you already run.
+
+KCPT turns a PostgreSQL database into durable background-work infrastructure.
+`kcpt-message-queue` posts and receives typed payloads under a lease, with automatic retry and dead-lettering.
+`kcpt-cron` fires a tick on a fixed schedule, exactly once across however many servers share the database, catching up in bounded chunks after downtime.
+Both are built on the same primitives — a lease, a retry count, `LISTEN`/`NOTIFY` wake-up — so taking one never drags in machinery for the other.
+
+.Main.kt — a message queue
+[source,kotlin]
+----
+val sink = MessageQueueSink(source = dataSource.asSource())
+val emails = sink.messageQueue("emails", EmailJob.serializer())
+
+// Producer
+emails.post(EmailJob(to = "user@example.com", subject = "Welcome"))
+
+// Consumer
+emails.workerPool { message ->
+    sendEmail(message.payload)
+    null // no notes to record
+}
+----
+
+.Main.kt — a cron
+[source,kotlin]
+----
+val cronSink = CronSink(source = dataSource.asSource())
+val cleanup = cronSink.cron("cleanup", Cron.Config(interval = 10.minutes))
+
+cleanup.run { from, to ->
+    deleteOldRecords(before = to)
+    null // no notes to record
+}
+----
+
+No broker to run, no extra scheduler process, no polling loop.
+Postgres notifies a consumer the moment work exists, and a cron tick stays on the clock across however many servers are listening for it.
+
+
+== Why KCPT
+
+No broker::
+Every guarantee is built on PostgreSQL alone — `LISTEN`/`NOTIFY`, advisory locks, `FOR UPDATE SKIP LOCKED`, a `JSON` column.
+If you already run Postgres, there is nothing else to deploy.
+
+Real-time wake-up, not polling::
+A consumer parked in `receive()`, or a cron server parked between ticks, is woken by a database notification the instant work becomes available — not on the next tick of a poll loop.
+A backstop timer exists for the case a notification never arrives, but it is a safety net, not the normal path.
+
+Lease, retry, dead-letter — built in, not bolted on::
+A message or a cron window is leased, not locked forever: a crashed consumer's work is picked up by another one automatically, a failure is retried up to a limit, and a permanently failing one is dead-lettered and reported rather than retried forever.
+
+Cron ticks stay on the wall clock, concurrently::
+A tick's window is computed once, from the schedule, and never shifted by how long a handler takes to run.
+Different windows can be worked by different servers at the same time — a handler slower than its own interval does not stall the schedule, as long as another server is free to pick up the next tick.
+
+Every guarantee is written down::
+Two long-form documents explain exactly how each guarantee holds, safeguard by safeguard, corner case by corner case: xref:internals:message-queue-algorithm.adoc[] and xref:internals:cron-algorithm.adoc[].
+This documentation is the front door; those documents are where "why can I trust this" actually gets answered.
+
+
+== How to read this documentation
+
+* xref:getting-started.adoc[] gets a queue and a cron running in a few minutes.
+* The *Core* section covers what both features share: xref:core:setup.adoc[setup], the xref:core:source.adoc[database connection], and the xref:core:schema.adoc[schema].
+* The *Message queue* and *Cron* sections explain each feature from the ground up.
+* The *Guides* section states the xref:guides:guarantees.adoc[guarantees] and shows how to xref:guides:testing.adoc[test] code that uses KCPT.
+* The *Internals* section is the design behind them.

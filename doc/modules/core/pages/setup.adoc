@@ -1,0 +1,50 @@
+= Setup
+
+KCPT ships three artifacts, published under the `net.kodein.kcpt` group:
+
+[cols="2,3"]
+|===
+| Artifact | Purpose
+
+| `kcpt-core`
+| `Source`, `PGChannel`, and the shared properties-table mechanism.
+Pulled in transitively by the other two — rarely a direct dependency.
+
+| `kcpt-message-queue`
+| `MessageQueueSink`, `MessageQueueSchema`, `MessageQueue<T>`, `Message<T>`, `workerPool`.
+
+| `kcpt-cron`
+| `CronSink`, `CronSchema`, `Cron`.
+|===
+
+KCPT is a JVM-only library, built and tested against a Java {jdk} toolchain.
+There is no Kotlin Multiplatform target, and none is planned: the library is a thin, direct layer over `java.sql`.
+
+
+== Gradle
+
+Take either feature module on its own, or both: they share one `kcpt-core`, with nothing extra to configure.
+
+[source,kotlin,subs="verbatim,attributes"]
+.build.gradle.kts
+----
+dependencies {
+    implementation("net.kodein.kcpt:kcpt-message-queue:{version}") // <1>
+    implementation("net.kodein.kcpt:kcpt-cron:{version}") // <2>
+}
+----
+<1> The message queue.
+<2> The cron.
+
+IMPORTANT: KCPT depends on the PostgreSQL JDBC driver internally, but does not expose it as part of its own API.
+Bring a driver and a connection pool the way your application already manages one.
+
+The payload of a queue is a `kotlinx.serialization` type, so the project also needs the `org.jetbrains.kotlin.plugin.serialization` plugin.
+
+
+== PostgreSQL
+
+Nothing exotic: `LISTEN`/`NOTIFY`, `pg_advisory_xact_lock`, `FOR UPDATE SKIP LOCKED`, and a `JSON` column type.
+Any reasonably current PostgreSQL server works — the test suite runs against Postgres 18.
+
+KCPT never talks to PostgreSQL through anything but a xref:source.adoc[`Source`].
