@@ -88,3 +88,11 @@ For the connection, the schema and the PostgreSQL requirements, see the https://
 == Documentation
 
 The full documentation is on https://kodeinkoders.github.io/KCPT[kodeinkoders.github.io/KCPT].
+
+== Developed by
+
+image::https://kodein-koders.com/app/uploads/2026/11/colored-invert.svg[Kodein Koders logo,link=https://kodein-koders.com]
+
+== Supported by
+
+image::https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg[JetBrains logo,link=https://jb.gg/OpenSourceSupport]
